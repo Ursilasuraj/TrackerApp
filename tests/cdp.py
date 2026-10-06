@@ -193,6 +193,14 @@ class Page:
             raise CDPError(f'{method}: {msg["error"]}')
         return msg.get('result', {})
 
+    def send_nowait(self, method, params=None):
+        """Send without waiting (e.g. a click that opens a modal dialog)."""
+        with self.cond:
+            self.next_id += 1
+            mid = self.next_id
+        self.ws.send(json.dumps({'id': mid, 'method': method, 'params': params or {}}))
+        return mid
+
     # -- events --------------------------------------------------------------
 
     def take_events(self, method=None):
@@ -290,6 +298,23 @@ class Page:
         x, y = self.center(selector)
         self.click_at(x, y, hold=hold, modifiers=modifiers)
 
+    def click_dialog(self, selector, accept=True, timeout=5):
+        """Click something that opens alert/confirm; answer it. Returns the dialog."""
+        x, y = self.center(selector)
+        self.move(x, y)
+        self.mouse('mousePressed', x, y, buttons=1)
+        time.sleep(0.1)
+        self.send_nowait('Input.dispatchMouseEvent', {'type': 'mouseReleased', 'x': x, 'y': y,
+                                                      'button': 'left', 'buttons': 0, 'clickCount': 1})
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            dialogs = self.take_events('Page.javascriptDialogOpening')
+            if dialogs:
+                self.send('Page.handleJavaScriptDialog', {'accept': accept})
+                return dialogs[0]['params']
+            time.sleep(0.05)
+        raise AssertionError('no dialog opened')
+
     def dblclick(self, selector):
         x, y = self.center(selector)
         self.click_at(x, y, hold=0.05, clicks=1)
@@ -349,7 +374,7 @@ class Page:
 
 
 class Browser:
-    def __init__(self, width=1200, height=820):
+    def __init__(self, width=1200, height=820, app_url=None):
         self.exe = find_browser()
         self.profile = tempfile.mkdtemp(prefix='tt-browser-')
         args = [self.exe, '--headless=new', '--remote-debugging-port=0',
@@ -358,8 +383,8 @@ class Browser:
                 '--disable-background-networking', '--disable-component-update', '--mute-audio',
                 '--disable-features=Translate,MediaRouter,OptimizationHints', '--no-pings',
                 '--disable-domain-reliability', '--disable-client-side-phishing-detection',
-                '--disable-default-apps', '--no-proxy-server', '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1',
-                'about:blank']
+                '--disable-default-apps', '--no-proxy-server', '--lang=en-US', '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1',
+                f'--app={app_url}' if app_url else 'about:blank']
         if os.name != 'nt' and hasattr(os, 'geteuid') and os.geteuid() == 0:
             args.insert(1, '--no-sandbox')
         self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -383,10 +408,31 @@ class Browser:
 
     def new_page(self, url='about:blank'):
         info = self._json('/json/new?' + urllib.request.quote(url, safe=':/?=&'), method='PUT')
-        return Page(info['webSocketDebuggerUrl'], self)
+        page = Page(info['webSocketDebuggerUrl'], self)
+        page.target_id = info['id']
+        return page
+
+    def close_page(self, page):
+        page.close()
+        try:
+            self._json('/json/close/' + page.target_id)
+        except Exception:
+            pass
 
     def targets(self):
         return self._json('/json/list')
+
+    def first_page(self):
+        """The window the browser opened itself (used with app_url)."""
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            pages = [t for t in self.targets() if t['type'] == 'page']
+            if pages:
+                page = Page(pages[0]['webSocketDebuggerUrl'], self)
+                page.target_id = pages[0]['id']
+                return page
+            time.sleep(0.05)
+        raise CDPError('no page target')
 
     def close(self):
         try:

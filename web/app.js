@@ -1011,6 +1011,7 @@
 
   function editorValues(t) {
     const v = Object.assign({}, t);
+    if (E.inflight && E.inflight.id === t.id) Object.assign(v, E.inflight.fields);
     if (E.pending.id === t.id) Object.assign(v, E.pending.fields);
     if (v.labels && v.labels.length && typeof v.labels[0] === 'string') {
       v.labels = v.labels.map((name) => labelByName(name) || (t.labels.find((l) => l.name.toLowerCase() === name.toLowerCase()))
