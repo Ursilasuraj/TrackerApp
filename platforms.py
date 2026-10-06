@@ -224,7 +224,8 @@ def open_window(url):
 MAC_ACTIVATE_SCRIPT = '''
 on run argv
   set wanted to item 1 of argv
-  repeat with appName in {"Microsoft Edge", "Google Chrome", "Brave Browser", "Chromium"}
+  repeat with i from 2 to count of argv
+    set appName to item i of argv
     if application appName is running then
       tell application appName
         repeat with w in windows
@@ -242,6 +243,17 @@ end run
 '''
 
 
+def _running_mac_browsers():
+    """The browsers of MAC_BROWSERS that run now. Found with ps, so osascript
+    starts only when there is a browser to ask (starting it can be slow), and
+    the script never names an app that is not installed."""
+    result = _run(['ps', '-axo', 'comm='], timeout=10)
+    if not result or result.returncode != 0:
+        return list(MAC_BROWSERS)               # unknown: the script checks
+    running = {os.path.basename(line.strip()) for line in result.stdout.decode('utf-8', 'replace').splitlines()}
+    return [name for name in MAC_BROWSERS if name in running]
+
+
 def activate_window():
     """Bring an open TodoTracker window to the front. True if one was found."""
     if os.environ.get('TODOTRACKER_NO_WINDOW') == '1':
@@ -254,7 +266,10 @@ def activate_window():
             return True
         return False
     if IS_MAC:
-        result = _run(['osascript', '-e', MAC_ACTIVATE_SCRIPT, WINDOW_TITLE], timeout=15)
+        browsers = _running_mac_browsers()
+        if not browsers:
+            return False                        # no browser runs, so there is no window
+        result = _run(['osascript', '-e', MAC_ACTIVATE_SCRIPT, WINDOW_TITLE, *browsers], timeout=15)
         return bool(result and result.returncode == 0 and result.stdout.strip() == b'ok')
     if shutil.which('wmctrl'):
         result = _run(['wmctrl', '-F', '-a', WINDOW_TITLE], timeout=10)

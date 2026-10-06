@@ -1086,6 +1086,26 @@ class PlatformTests(unittest.TestCase):
             self.assertTrue(platforms.open_window('http://127.0.0.1:1/'))
             self.assertFalse(platforms.activate_window())
 
+    def test_mac_activation_asks_only_running_browsers(self):
+        self.on('mac')
+        ps = ('/sbin/launchd\n/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n'
+              '/Applications/Google Chrome.app/Contents/Frameworks/Helpers/Google Chrome Helper (Renderer)\n')
+        calls = []
+
+        def run(args, timeout=30, **kw):
+            calls.append(args)
+            out = ps if args[0] == 'ps' else 'ok\n'
+            return subprocess.CompletedProcess(args, 0, out.encode(), b'')
+
+        with mock.patch.dict(os.environ, {'TODOTRACKER_NO_WINDOW': '0'}), mock.patch.object(platforms, '_run', run):
+            self.assertTrue(platforms.activate_window())
+            self.assertEqual(calls[-1][0], 'osascript')
+            self.assertEqual(calls[-1][3:], [platforms.WINDOW_TITLE, 'Google Chrome'])
+            ps = '/sbin/launchd\n/Applications/Safari.app/Contents/MacOS/Safari\n'
+            calls.clear()
+            self.assertFalse(platforms.activate_window())
+            self.assertEqual([c[0] for c in calls], ['ps'])     # no browser runs: no osascript
+
     def test_problems_show_a_box_unless_there_is_no_window(self):
         # Without a window nobody could close the box, and the app would wait forever.
         import ctypes
