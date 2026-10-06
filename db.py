@@ -414,6 +414,84 @@ def golden_color(n):
 
 
 # ---------------------------------------------------------------------------
+# Import helpers (lenient: older exports may differ in details)
+# ---------------------------------------------------------------------------
+
+def _import_stamp(value):
+    if not isinstance(value, str):
+        return None
+    v = value.strip().replace(' ', 'T', 1)
+    m = re.match(r'^(\d{4}-\d{2}-\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?)?', v)
+    if not m:
+        return None
+    try:
+        dt = datetime.fromisoformat(f'{m.group(1)}T{m.group(2) or "00"}:{m.group(3) or "00"}:{m.group(4) or "00"}')
+    except ValueError:
+        return None
+    return dt.isoformat()
+
+
+def _import_due(value):
+    if not isinstance(value, str):
+        return None
+    v = value.strip().replace(' ', 'T', 1)
+    for candidate in (v, v[:16], v[:10]):
+        try:
+            return clean_due(candidate)
+        except ValidationError:
+            continue
+    return None
+
+
+def _import_status(value, done=None):
+    v = str(value or '').strip().lower().replace('-', '_').replace(' ', '_')
+    if v in ('done', 'completed', 'complete', 'closed', 'finished') or done is True:
+        return 'done'
+    if v in ('in_progress', 'inprogress', 'progress', 'doing', 'started', 'active', 'wip'):
+        return 'in_progress'
+    return 'open'
+
+
+def _import_priority(value):
+    v = str(value or '').strip().lower()
+    if v in ('high', 'h', '1', 'urgent', 'important'):
+        return 'high'
+    if v in ('low', 'l', '3'):
+        return 'low'
+    return 'medium'
+
+
+def _import_label_name(value):
+    if not isinstance(value, str):
+        return None
+    name = re.sub(r'[\s,#]+', '-', value.strip().lstrip('#')).strip('-')[:MAX_LABEL]
+    return name or None
+
+
+def _import_matrix(item):
+    m = item.get('matrix')
+    if m is None and item.get('mx') is not None and item.get('my') is not None:
+        m = [item.get('mx'), item.get('my')]
+    try:
+        m = clean_matrix(m)
+    except ValidationError:
+        m = None
+    return (m[0], m[1]) if m else (None, None)
+
+
+def _import_dep_keys(d):
+    if not isinstance(d, dict):
+        return None, None
+    if isinstance(d.get('before'), str) and isinstance(d.get('after'), str):
+        return d['before'], d['after']
+    before = f"t{d['before_task_id']}" if d.get('before_task_id') is not None else (
+        f"s{d['before_subtask_id']}" if d.get('before_subtask_id') is not None else None)
+    after = f"t{d['after_task_id']}" if d.get('after_task_id') is not None else (
+        f"s{d['after_subtask_id']}" if d.get('after_subtask_id') is not None else None)
+    return before, after
+
+
+# ---------------------------------------------------------------------------
 # Store
 # ---------------------------------------------------------------------------
 
@@ -1484,6 +1562,163 @@ class Store:
                     f"SELECT s.id, s.title, s.due_at, t.id, t.title FROM subtasks s JOIN tasks t ON t.id = s.task_id "
                     f"WHERE s.done = 0 AND t.status != 'done' AND s.due_at IS NOT NULL AND s.reminded_at IS NULL "
                     f"AND {moment} <= ? ORDER BY {moment}, s.id", (current,))]
+
+    # -- import ------------------------------------------------------------
+
+    def import_data(self, data):
+        """Add the contents of an Export JSON file. Old ids are mapped to new
+        ones; a task whose title and created time already exist is skipped
+        (so importing the same file twice adds nothing). Lenient about the
+        exact shape, since older versions may have written it differently."""
+        if not isinstance(data, dict) or not isinstance(data.get('tasks'), list):
+            raise ValidationError('This file is not a TodoTracker export (no task list found).')
+        now = now_dt()
+        stamp = now_iso(now)
+        summary = {'tasks': 0, 'skipped': 0, 'invalid': 0, 'subtasks': 0, 'labels': 0,
+                   'dependencies': 0, 'dependencies_skipped': 0}
+        key_map = {}
+        with self.write() as c:
+            colors = {}
+            for l in data.get('labels') or []:
+                if isinstance(l, dict) and isinstance(l.get('name'), str):
+                    name = _import_label_name(l['name'])
+                    color = l.get('color')
+                    if name and isinstance(color, str) and COLOR_RE.match(color):
+                        colors[name.lower()] = color.lower()
+            label_ids = {}
+
+            def label_id(raw):
+                name = _import_label_name(raw.get('name') if isinstance(raw, dict) else raw)
+                if not name:
+                    return None
+                if name.lower() in label_ids:
+                    return label_ids[name.lower()]
+                row = c.execute('SELECT id FROM labels WHERE name = ?', (name,)).fetchone()
+                if row:
+                    lid = row[0]
+                else:
+                    color = colors.get(name.lower())
+                    used = {r[0].lower() for r in c.execute('SELECT color FROM labels')}
+                    if not color or color in used:
+                        color = self._next_color(c)
+                    lid = c.execute('INSERT INTO labels(name, color, created_at) VALUES (?, ?, ?)',
+                                    (name, color, stamp)).lastrowid
+                    summary['labels'] += 1
+                label_ids[name.lower()] = lid
+                return lid
+
+            for t in data['tasks']:
+                if not isinstance(t, dict):
+                    summary['invalid'] += 1
+                    continue
+                try:
+                    title = clean_title(str(t.get('title') or ''))
+                except ValidationError:
+                    summary['invalid'] += 1
+                    continue
+                created = _import_stamp(t.get('created_at')) or stamp
+                old_id = t.get('id')
+                subs_in = [x for x in (t.get('subtasks') or []) if isinstance(x, dict)]
+                existing = c.execute('SELECT id FROM tasks WHERE title = ? AND created_at = ?',
+                                     (title, created)).fetchone()
+                if existing:
+                    summary['skipped'] += 1
+                    if old_id is not None:
+                        key_map[f't{old_id}'] = f't{existing[0]}'
+                    for sub in subs_in:
+                        row = c.execute('SELECT id FROM subtasks WHERE task_id = ? AND title = ? AND created_at = ?',
+                                        (existing[0], str(sub.get('title') or '').strip(),
+                                         _import_stamp(sub.get('created_at')) or '')).fetchone()
+                        if row and sub.get('id') is not None:
+                            key_map[f"s{sub['id']}"] = f's{row[0]}'
+                    continue
+                status = _import_status(t.get('status'), t.get('done'))
+                due = _import_due(t.get('due_at') or t.get('due'))
+                completed = _import_stamp(t.get('completed_at')) or (stamp if status == 'done' else None)
+                mx, my = _import_matrix(t)
+                reminded = _import_stamp(t.get('reminded_at')) or rearm_value(due, now)
+                desc = t.get('description') if isinstance(t.get('description'), str) else ''
+                try:
+                    desc = clean_description(desc)
+                except ValidationError:
+                    desc = desc[:MAX_DESCRIPTION]
+                task_id = c.execute(
+                    'INSERT INTO tasks(title, description, status, priority, created_at, updated_at, due_at, '
+                    'completed_at, reminded_at, mx, my) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (title, desc, status, _import_priority(t.get('priority')), created,
+                     _import_stamp(t.get('updated_at')) or created, due,
+                     completed if status == 'done' else None, reminded, mx, my)).lastrowid
+                summary['tasks'] += 1
+                if old_id is not None:
+                    key_map[f't{old_id}'] = f't{task_id}'
+                task_labels = []
+                for raw in (t.get('labels') or [])[:MAX_LABELS_PER_TASK]:
+                    lid = label_id(raw)
+                    if lid and lid not in task_labels:
+                        task_labels.append(lid)
+                        c.execute('INSERT INTO task_labels(task_id, label_id) VALUES (?, ?)', (task_id, lid))
+                subs_in.sort(key=lambda x: x.get('position') if isinstance(x.get('position'), int) else 10**9)
+                for pos, sub in enumerate(subs_in):
+                    try:
+                        sub_title = clean_title(str(sub.get('title') or ''), 'Subtask title')
+                    except ValidationError:
+                        summary['invalid'] += 1
+                        continue
+                    done = bool(sub.get('done'))
+                    s_created = _import_stamp(sub.get('created_at')) or created
+                    s_due = _import_due(sub.get('due_at') or sub.get('due'))
+                    notes = sub.get('notes') if isinstance(sub.get('notes'), str) else ''
+                    notes = notes.replace('\r\n', '\n').replace('\r', '\n').rstrip()[:MAX_NOTES]
+                    smx, smy = _import_matrix(sub)
+                    sid = c.execute(
+                        'INSERT INTO subtasks(task_id, title, done, position, created_at, completed_at, due_at, '
+                        'reminded_at, notes, mx, my) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        (task_id, sub_title, int(done), pos, s_created,
+                         (_import_stamp(sub.get('completed_at')) or stamp) if done else None, s_due,
+                         _import_stamp(sub.get('reminded_at')) or rearm_value(s_due, now), notes, smx, smy)).lastrowid
+                    summary['subtasks'] += 1
+                    if sub.get('id') is not None:
+                        key_map[f"s{sub['id']}"] = f's{sid}'
+                    for raw in sub.get('labels') or []:
+                        lid = label_id(raw)
+                        if lid in task_labels:      # only the task's own labels
+                            c.execute('INSERT OR IGNORE INTO subtask_labels(subtask_id, label_id) VALUES (?, ?)',
+                                      (sid, lid))
+                self._fts_sync(c, task_id)
+
+            existing_deps = {(d['before'], d['after']) for d in self._deps(c)}
+            following = {}
+            for b, a in existing_deps:
+                following.setdefault(b, []).append(a)
+            for d in data.get('dependencies') or data.get('deps') or []:
+                before, after = _import_dep_keys(d)
+                before, after = key_map.get(before), key_map.get(after)
+                if not before or not after or before == after or (before, after) in existing_deps:
+                    summary['dependencies_skipped'] += 1
+                    continue
+                stack, seen, loop = [after], set(), False
+                while stack:
+                    node = stack.pop()
+                    if node == before:
+                        loop = True
+                        break
+                    if node not in seen:
+                        seen.add(node)
+                        stack.extend(following.get(node, ()))
+                if loop:
+                    summary['dependencies_skipped'] += 1
+                    continue
+                bk, bid = parse_key(before)
+                ak, aid = parse_key(after)
+                c.execute('INSERT INTO dependencies(before_task_id, before_subtask_id, after_task_id, '
+                          'after_subtask_id, created_at) VALUES (?, ?, ?, ?, ?)',
+                          (bid if bk == 't' else None, bid if bk == 's' else None,
+                           aid if ak == 't' else None, aid if ak == 's' else None,
+                           _import_stamp(d.get('created_at') if isinstance(d, dict) else None) or stamp))
+                existing_deps.add((before, after))
+                following.setdefault(before, []).append(after)
+                summary['dependencies'] += 1
+        return summary
 
     # -- export ------------------------------------------------------------
 

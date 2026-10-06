@@ -23,9 +23,10 @@ import db as dbmod
 APP_NAME = 'TodoTracker'
 # Bump when the API or the schema changes. The page compares it with the
 # version it was written for (CLIENT_API in web/app.js).
-API = 4
+API = 5
 
 MAX_JSON = 4 * 1024 * 1024
+MAX_IMPORT = 64 * 1024 * 1024
 MAX_IMAGE = 25 * 1024 * 1024
 MAX_QUERY = 200
 
@@ -184,6 +185,7 @@ class Handler(BaseHTTPRequestHandler):
         ('POST', r'/api/deps', 'api_add_dep'),
         ('DELETE', r'/api/deps/(\d+)', 'api_delete_dep'),
         ('POST', r'/api/matrix', 'api_matrix'),
+        ('POST', r'/api/import', 'api_import'),
         ('POST', r'/api/tasks', 'api_create_task'),
         ('POST', r'/api/tasks/(\d+)/subtasks', 'api_add_subtasks'),
         ('POST', r'/api/tasks/(\d+)/subtasks/order', 'api_order_subtasks'),
@@ -520,6 +522,15 @@ class Handler(BaseHTTPRequestHandler):
             f.write(data)
         os.replace(tmp, os.path.join(self.app.images_dir, name))
         self._send_json(201, {'url': f'/images/{name}', 'size': len(data)})
+
+    def api_import(self, query):
+        data = self._json_body(MAX_IMPORT)
+        summary = self.app.store.import_data(data)
+        # Images are not part of an export; say if the descriptions point at
+        # pictures that are not in data/images (copy that folder over).
+        names = set(re.findall(r'/images/([0-9a-f]{32}\.(?:png|jpg|gif|webp|bmp))', json.dumps(data)))
+        summary['missing_images'] = sum(1 for n in names if not os.path.exists(os.path.join(self.app.images_dir, n)))
+        self._send_json(200, {'summary': summary})
 
     def api_export(self, query):
         data = self.app.store.export()

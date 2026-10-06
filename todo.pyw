@@ -184,14 +184,22 @@ def port_owner(port):
 def process_alive(pid):
     if os.name == 'nt':
         import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
         SYNCHRONIZE = 0x00100000
-        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
         if not handle:
             return False
         try:
-            return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT: still running
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(handle)
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
@@ -306,7 +314,10 @@ def message_box(text):
     if os.name == 'nt':
         try:
             import ctypes
-            ctypes.windll.user32.MessageBoxW(None, text, 'TodoTracker', 0x10)
+            from ctypes import wintypes
+            user32 = ctypes.WinDLL('user32')
+            user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+            user32.MessageBoxW(None, text, 'TodoTracker', 0x10)
         except Exception:
             pass
     elif sys.stderr is not None:

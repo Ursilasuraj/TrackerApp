@@ -255,8 +255,13 @@ class Page:
         if wait:
             self.wait_for('document.readyState === "complete"', timeout=10)
 
-    def reload(self):
+    def reload(self, wait=False):
+        """Reload; with wait=True, return once the new document is complete."""
+        if wait:
+            self.eval('window.__ttOldDocument = true')
         self.send('Page.reload', {'ignoreCache': True})
+        if wait:
+            self.wait_for('!window.__ttOldDocument && document.readyState === "complete"', timeout=10)
 
     # -- geometry ------------------------------------------------------------
 

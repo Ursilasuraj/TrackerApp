@@ -608,7 +608,7 @@ button.chip { border: 0; cursor: pointer; }
 .note-link:hover { background: var(--surface-3); color: var(--accent); }
 .note.done { background: var(--surface-2); }
 .note.done .note-title { color: var(--text-2); text-decoration: line-through; }
-.note.dim { background: var(--surface-2); border-color: var(--border); box-shadow: none; }
+.note.dim { background: var(--surface-2); border-color: var(--border); border-left-color: var(--qc, var(--field)); box-shadow: none; }
 .note.dim .note-title { color: var(--text-2); }
 .note.traced { box-shadow: 0 0 0 2px var(--accent), var(--shadow-sm); }
 .note.traced.origin { box-shadow: 0 0 0 3px var(--accent), var(--shadow); }

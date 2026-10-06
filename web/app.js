@@ -16,8 +16,8 @@
   const MD = window.TTMarkdown;
   const ROOT = document.documentElement;
   const BOOT = { api: Number(ROOT.dataset.api) || 0, build: ROOT.dataset.build || '' };
-  const CLIENT_API = 4;            // the server API this page is written for
-  const FEATURE_API = { subtasks: 2, subtaskDetails: 3 };   // feature -> minimum server API
+  const CLIENT_API = 5;            // the server API this page is written for
+  const FEATURE_API = { subtasks: 2, subtaskDetails: 3, import: 5 };   // feature -> minimum server API
   const KEEPALIVE_BUDGET = 60000;  // Chromium allows 64 KB of keepalive bodies in flight
   const STATUS_NAMES = { open: 'Open', in_progress: 'In progress', done: 'Done' };
   const PRIORITY_NAMES = { high: 'High', medium: 'Medium', low: 'Low' };
@@ -373,10 +373,17 @@
     return out;
   }
 
+  /** Copies of subtask objects. The list, the editor and the matrix must
+   *  never share subtask arrays: an optimistic change applied to each copy
+   *  would otherwise land twice in a shared one. */
+  function cloneSubtasks(subs) {
+    return (subs || []).map((s) => Object.assign({}, s, { labels: (s.labels || []).slice() }));
+  }
+
   /** A full task arrived from the server (after a write): update everything. */
   function applyTask(task) {
     const i = S.tasks.findIndex((t) => t.id === task.id);
-    if (i >= 0) S.tasks[i] = Object.assign({}, S.tasks[i], task);
+    if (i >= 0) S.tasks[i] = Object.assign({}, S.tasks[i], task, { subtasks: cloneSubtasks(task.subtasks) });
     if (E.task && E.task.id === task.id) E.task = task;
     emit('task', task);
   }
@@ -519,6 +526,36 @@
     document.body.append(a);
     a.click();
     a.remove();
+  }
+
+  /** Import JSON: read an Export JSON file and add its contents. */
+  function importJSON() {
+    const input = $('#import-file');
+    input.value = '';
+    input.onchange = async () => {
+      const file = input.files && input.files[0];
+      if (!file) return;
+      let text;
+      try {
+        text = await file.text();
+        JSON.parse(text);
+      } catch (e) {
+        toast('“' + file.name + '” is not a JSON file.', { kind: 'error' });
+        return;
+      }
+      try {
+        const res = await api('POST', '/api/import', new Blob([text], { type: 'application/json' }));
+        const s = res.summary;
+        let msg = 'Imported ' + s.tasks + (s.tasks === 1 ? ' task' : ' tasks') + ', ' + s.subtasks + ' subtasks, '
+          + s.labels + ' new labels and ' + s.dependencies + ' links.';
+        if (s.skipped) msg += ' Skipped ' + s.skipped + (s.skipped === 1 ? ' task that was' : ' tasks that were') + ' already here.';
+        if (s.invalid) msg += ' ' + s.invalid + ' entries could not be read.';
+        if (s.missing_images) msg += ' ' + s.missing_images + ' pictures are missing: copy the old data\\images folder too.';
+        toast(msg, { timeout: 15000 });
+        refresh();
+      } catch (e) { errorToast('Import failed:', e); }
+    };
+    input.click();
   }
 
   async function backupNow() {
@@ -1781,8 +1818,11 @@
   }
 
   function mutate(taskId, fn) {
+    const seen = new Set();
     for (const t of taskCopies(taskId)) {
       t.subtasks = t.subtasks || [];
+      if (seen.has(t.subtasks)) t.subtasks = cloneSubtasks(t.subtasks);   // never apply twice to one array
+      seen.add(t.subtasks);
       fn(t);
       t.subtasks.forEach((s, i) => { s.position = i; });
       recount(t);
@@ -2383,7 +2423,7 @@
       if (!Q.byTask.has(t.id)) continue;
       const local = currentTask(t.id);
       if (local && local.subtasks) {
-        t.subtasks = local.subtasks;
+        t.subtasks = cloneSubtasks(local.subtasks);
         recount(t);
       }
     }
@@ -2392,7 +2432,7 @@
 
   function mergeEditorLocal(task) {
     if (Q.byTask.has(task.id) && E.task && E.task.id === task.id && E.task.subtasks) {
-      task.subtasks = E.task.subtasks;
+      task.subtasks = cloneSubtasks(E.task.subtasks);
       recount(task);
     }
     return task;
@@ -2692,7 +2732,7 @@
     rowExtraBadges, rowExtra, listAction, listChange, listKeydown, editorSubtasksHTML, editorKeydown,
     editorAction, editorChange, editorInput, editorFocusout, convertChecklist, beforeEditorSwitch,
     mergeLocal: mergeLocalSubtasks, mergeEditorLocal, pendingSubtaskRequests, clearPendingSubtasks,
-    flushSubtasks, subtaskChain: () => Q.chain,
+    flushSubtasks, subtaskChain: () => Q.chain, importJSON, cloneSubtasks,
     // subtask details
     subtaskMetaHTML: subMetaHTML, subtaskButtonsHTML: subButtonsHTML, subtaskDetailsHTML: subDetailsHTML,
     openSubtaskDetails, parseSubtaskInput, subtaskTokenFields, subtaskItemExtra, subtaskActionExtra,

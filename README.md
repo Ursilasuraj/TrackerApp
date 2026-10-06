@@ -177,6 +177,27 @@ When a target time arrives a Windows notification appears (date-only targets
 at 09:00). More than three at once become one summary. Changing a target date
 re-arms its reminder.
 
+### Day / Night / Auto
+
+The switch at the bottom of the sidebar: **☀ Day · ☾ Night · ◐ Auto** (Auto
+follows the Windows light/dark setting live). The choice is remembered and
+other open windows follow it. The theme is set before the first paint, so
+the wrong one never flashes. Both themes meet **WCAG 2.1 AA**: 4.5:1 for
+text, 3:1 for large text and for meaningful non-text UI (focus rings, field
+borders, priority edges, arrows, label dots); every control shows a visible
+focus ring when used with the keyboard.
+
+### Moving from another PC
+
+On the old PC: sidebar → **Export JSON**. On the new one: **Import JSON**
+and pick that file. Labels, tasks, subtasks (with dates, labels, notes and
+matrix positions) and links are added with their original timestamps;
+importing the same file again adds nothing (a task whose title and created
+time already exist is skipped). A summary shows what was imported.
+Pictures are not inside the export file: copy the old `data\images` folder
+into the new `data` folder as well (the summary says when pictures are
+missing).
+
 ## Data
 
 Everything lives in `data` next to the code (the environment variable
@@ -311,6 +332,7 @@ DELETE /api/deps/{id}
 PATCH  /api/labels/{id}            {name?, color?}   (renaming onto an existing name merges)
 DELETE /api/labels/{id}
 POST   /api/images                 raw image body (PNG, JPEG, GIF, WebP, BMP; ≤ 25 MB)
+POST   /api/import                     an Export JSON file (adds; skips tasks that already exist)
 POST   /api/backup | /api/shutdown
 ```
 
@@ -328,3 +350,8 @@ python -m unittest tests.test_ui -v         # headless Edge/Chromium, real mouse
 The UI tests drive the browser over the DevTools protocol with
 `Input.dispatchMouseEvent` presses (~100 ms) and real key events; set
 `TT_BROWSER` to the browser executable if it is not found automatically.
+They include a contrast scan of every screen in both themes
+(`tests/contrast_scan.js`: text, placeholders, field borders, priority
+edges, label dots, quadrant edges, arrows and focus rings).
+
+The Node tests need Node.js 18 or newer, which the app itself does not.

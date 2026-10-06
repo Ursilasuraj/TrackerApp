@@ -684,6 +684,36 @@ class SubtaskTests(UICase):
         p.wait_for('JSON.stringify(TT.E.task.subtasks.map(s => s.title + (s.done ? " ✓" : ""))) === %s' % js(json.dumps(want, ensure_ascii=False, separators=(',', ':'))))
         self.assertTrue(p.eval('TT.E.task.subtasks.every(s => s.id > 0)'))
 
+    def test_refresh_while_writes_are_pending_never_duplicates(self):
+        t = self.task('Dups')
+        p = self.open()
+        self.open_editor('Dups')
+        # Keep subtask writes pending for a while (slow answers), then refresh in between.
+        p.eval('''(() => { const f = window.fetch; window.fetch = (u, o) => f(u, o).then(r =>
+            String(u).includes('/subtasks') ? new Promise(res => setTimeout(() => res(r), 400)) : r); })()''')
+        p.click('[data-k="sub:add"]')
+        p.type('one')
+        p.key('Enter')
+        p.eval('TT.refresh()')
+        time.sleep(0.2)
+        p.type('two')
+        p.key('Enter')
+        p.eval('TT.refresh()')
+        time.sleep(0.2)
+        p.type('three')
+        p.key('Enter')
+        for _ in range(12):
+            state = p.eval(f'''(() => {{ const t = TT.taskById({t["id"]}); const ids = TT.E.task.subtasks.map(s => s.id);
+                return {{rows: document.querySelectorAll("#editor li.sub").length, subs: ids.length,
+                         unique: new Set(ids).size, shared: !!t && t.subtasks === TT.E.task.subtasks}}; }})()''')
+            self.assertEqual(state['rows'], state['subs'], state)
+            self.assertEqual(state['unique'], state['subs'], state)
+            self.assertFalse(state['shared'], 'list and editor must not share a subtask array')
+            time.sleep(0.1)
+        self.wait_idle()
+        self.assertEqual(self.server_subs(t['id']), ['one', 'two', 'three'])
+        self.assertEqual(self.subs(), ['one', 'two', 'three'])
+
     def test_click_right_after_editing_a_subtask_title(self):
         t = self.task('T')
         self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['a', 'b']}, expect=201)
@@ -1111,6 +1141,208 @@ class MatrixTests(UICase):
         self.assertAlmostEqual(pos[0], 0.2 + (x1 - x0) / r['w'], delta=0.01)
         self.assertAlmostEqual(pos[1], 0.8 - (y1 - y0) / r['h'], delta=0.01)
         p.wait_for('document.querySelector(".mx-tray").textContent.includes("Background changed")', timeout=6)
+
+
+class ImportTests(UICase):
+    def test_import_json_from_the_sidebar(self):
+        export = {'app': 'TodoTracker', 'labels': [{'name': 'moved', 'color': '#0d9488'}],
+                  'tasks': [{'id': 7, 'title': 'From the old PC', 'created_at': '2025-03-04T05:06:07', 'labels': ['moved'],
+                             'subtasks': [{'id': 9, 'title': 'old subtask', 'done': True}]}],
+                  'dependencies': []}
+        path = os.path.join(self.srv.data, 'export.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(export, f)
+        p = self.open()
+        p.send('Page.setInterceptFileChooserDialog', {'enabled': True})
+        p.take_events()
+        p.click('[data-k="side:import"]')
+        deadline = time.time() + 5
+        chooser = None
+        while time.time() < deadline and not chooser:
+            ev = p.take_events('Page.fileChooserOpened')
+            chooser = ev[0]['params'] if ev else None
+            time.sleep(0.05)
+        self.assertIsNotNone(chooser, 'the file chooser opened')
+        p.send('DOM.setFileInputFiles', {'files': [path], 'backendNodeId': chooser['backendNodeId']})
+        p.wait_for('Array.from(document.querySelectorAll(".toast")).some(t => t.textContent.includes("Imported 1 task, 1 subtasks, 1 new labels"))', timeout=8)
+        self.wait_rows(['From the old PC'])
+        task = self.api('GET', '/api/tasks')['tasks'][0]
+        self.assertEqual((task['created_at'], task['progress'], task['labels'][0]['color']), ('2025-03-04T05:06:07', [1, 1], '#0d9488'))
+
+
+MARKDOWN_SAMPLE = ('# Heading one\n## Heading two\n### Heading three\nSome **bold**, *italic*, ~~gone~~, `code` and '
+                   '[a link](https://example.com/a_b).\n\n> A quoted line\n\n- [ ] open item\n- [x] done item\n'
+                   '1. first\n2. second\n\n---\n```\ncode block\n```\n')
+
+
+class ThemeTests(UICase):
+    def scan(self, where):
+        p = self.page
+        if not p.eval('typeof window.__ttContrastScan === "function"'):
+            with open(os.path.join(HERE, 'contrast_scan.js'), encoding='utf-8') as f:
+                p.eval(f.read())
+        return [f'{where}: {x}' for x in p.eval('window.__ttContrastScan()')]
+
+    def focus_scan(self, where, selector=None):
+        p = self.page
+        p.key('Tab')        # keyboard modality, so programmatic focus shows :focus-visible
+        return [f'{where}: {x}' for x in p.eval('window.__ttFocusScan(%s)' % (js(selector) if selector else ''))]
+
+    def set_theme(self, pref):
+        p = self.page
+        p.eval(f'localStorage.setItem("tt-theme", {js(pref)})')
+        p.reload(wait=True)
+        p.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+
+    def rich_data(self):
+        today = time.strftime('%Y-%m-%d')
+        labels = [f'label{i}' for i in range(15)]
+        from helpers import request
+        st, img, _ = request(self.srv.port, 'POST', '/api/images', raw=PNG, headers={'Content-Type': 'image/png'})
+        self.image_url = img['url']
+        a = self.task('Overdue high task', due_at='2020-02-02', priority='high', labels=labels[:5],
+                      description='Snippet text here ![pic](%s)' % img['url'])
+        b = self.task('In progress for today', due_at=today, labels=labels[5:10])
+        self.api('PATCH', f'/api/tasks/{b["id"]}', {'status': 'in_progress'})
+        c = self.task('Low and later', due_at='2031-05-05', priority='low', labels=labels[10:], description=MARKDOWN_SAMPLE)
+        task = self.api('POST', f'/api/tasks/{c["id"]}/subtasks', {'items': [
+            {'title': 'Subtask with everything', 'due_at': today, 'labels': ['label10'], 'notes': 'Notes first line'},
+            {'title': 'Finished subtask', 'done': True}, {'title': 'Overdue subtask', 'due_at': '2020-01-01'}]}, expect=201)
+        d = self.task('Already done')
+        self.api('PATCH', f'/api/tasks/{d["id"]}', {'status': 'done'})
+        e = self.task('Delegate me', due_at=today, priority='low')
+        s1, s2 = task['subtasks'][0]['id'], task['subtasks'][2]['id']
+        self.api('POST', '/api/matrix', {'items': [
+            {'key': f't{a["id"]}', 'matrix': [0.8, 0.85]}, {'key': f't{b["id"]}', 'matrix': [0.2, 0.8]},
+            {'key': f't{e["id"]}', 'matrix': [0.8, 0.2]}, {'key': f's{s1}', 'matrix': [0.2, 0.25]},
+            {'key': f't{d["id"]}', 'matrix': [0.6, 0.6]}]}, expect=200)
+        self.api('POST', '/api/deps', {'before': f't{d["id"]}', 'after': f't{a["id"]}'})
+        self.api('POST', '/api/deps', {'before': f's{s1}', 'after': f't{e["id"]}'})
+        self.api('POST', '/api/deps', {'before': f's{s2}', 'after': f't{b["id"]}'})
+        return a, b, c, d, e
+
+    def test_switch_persists_follows_os_and_other_windows(self):
+        p = self.open()
+        self.assertEqual(p.eval('document.documentElement.dataset.theme'), 'light')
+        p.click('[data-k="theme:night"]')
+        p.wait_for('document.documentElement.dataset.theme === "dark"')
+        self.assertEqual(p.eval('localStorage.getItem("tt-theme")'), 'night')
+        self.assertEqual(p.eval('document.querySelector("meta[name=theme-color]").content'), '#111317')
+        self.assertEqual(p.eval('getComputedStyle(document.documentElement).colorScheme'), 'dark')
+        p.reload(wait=True)
+        p.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+        self.assertEqual(p.eval('document.documentElement.dataset.theme'), 'dark')
+        # Auto follows the operating system, live.
+        p.click('[data-k="theme:auto"]')
+        p.wait_for('document.documentElement.dataset.theme === "light"')
+        p.send('Emulation.setEmulatedMedia', {'features': [{'name': 'prefers-color-scheme', 'value': 'dark'}]})
+        p.wait_for('document.documentElement.dataset.theme === "dark"')
+        p.send('Emulation.setEmulatedMedia', {'features': [{'name': 'prefers-color-scheme', 'value': 'light'}]})
+        p.wait_for('document.documentElement.dataset.theme === "light"')
+        # Another window follows through the storage event.
+        other = self.browser.new_page()
+        try:
+            other.navigate(self.srv.url)
+            other.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+            p.click('[data-k="theme:night"]')
+            other.wait_for('document.documentElement.dataset.theme === "dark"', timeout=5)
+            self.assertEqual(other.eval('document.querySelector(\'[data-k="theme:night"]\').getAttribute("aria-checked")'), 'true')
+        finally:
+            self.browser.close_page(other)
+        # An unknown stored value means Auto.
+        p.eval('localStorage.setItem("tt-theme", "sepia")')
+        p.reload(wait=True)
+        p.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+        self.assertEqual(p.eval('document.documentElement.dataset.themePref'), 'auto')
+        self.assertEqual(p.eval('document.documentElement.dataset.theme'), 'light')
+
+    def test_no_flash_of_the_wrong_theme(self):
+        p = self.open()
+        p.eval('localStorage.setItem("tt-theme", "night")')
+        p.send('Page.addScriptToEvaluateOnNewDocument', {'source': (
+            'new MutationObserver((m, obs) => { if (document.body) { obs.disconnect();'
+            ' window.__first = {theme: document.documentElement.dataset.theme,'
+            ' bg: getComputedStyle(document.documentElement).getPropertyValue("--bg").trim(),'
+            ' meta: document.querySelector("meta[name=theme-color]").content}; } })'
+            '.observe(document, {childList: true, subtree: true});')})
+        p.reload()
+        p.wait_for('!!window.__first', timeout=8)
+        self.assertEqual(p.eval('window.__first'), {'theme': 'dark', 'bg': '#111317', 'meta': '#111317'})
+
+    def test_wcag_contrast_every_screen_in_both_themes(self):
+        a, b, c, d, e = self.rich_data()
+        p = self.open()
+        failures = []
+        for pref in ('day', 'night'):
+            self.set_theme(pref)
+            theme = p.eval('document.documentElement.dataset.theme')
+            # List, sorted by date (group headings), one task unfolded, quick-add chips and suggestions.
+            p.eval('document.querySelector("#sort").value = "due"; document.querySelector("#sort").dispatchEvent(new Event("change"))')
+            p.wait_for('!!document.querySelector(".group-head")')
+            p.click(self.row_sel('Low and later', '.sub-badge'))
+            p.wait_for('!!document.querySelector(".mini-sub")')
+            p.click('#qa')
+            p.type('New thing #label1 !h ^nonsense #lab')
+            p.wait_for('!document.querySelector("#qa-suggest").hidden')
+            failures += self.scan(f'{theme}/list')
+            failures += self.focus_scan(f'{theme}/list', '#side-content button, #side-content [tabindex], #list button, #list input, #qa, #search, #sort')
+            p.key('a', 'ctrl')
+            p.key('Backspace')
+            p.click('[data-k="nav:done"]')
+            self.wait_rows(['Already done'])
+            failures += self.scan(f'{theme}/done')
+            p.click('[data-k="nav:all"]')
+            p.wait_for('document.querySelectorAll("#list .row").length === 5')
+            # Editor with subtasks, details, preview and label suggestions.
+            self.open_editor('Low and later')
+            sid = p.eval('TT.E.task.subtasks[0].id')
+            p.click(f'[data-k="s{sid}:more"]')
+            p.click('[data-k="ed:label-input"]')
+            p.type('lab')
+            p.wait_for('!document.querySelector("#ed-label-suggest").hidden')
+            failures += self.scan(f'{theme}/editor')
+            failures += self.focus_scan(f'{theme}/editor', '#editor button, #editor input, #editor select, #editor textarea')
+            p.key('Escape')
+            p.key('Escape')
+            p.key('Escape')
+            # Toasts.
+            p.eval('TT.toast("A normal message", {action: "Undo", onAction() {}}); TT.toast("An error message", {kind: "error"})')
+            failures += self.scan(f'{theme}/toasts')
+            p.eval('document.querySelectorAll(".toast").forEach(t => t.remove())')
+            # Matrix: done notes, a selected link, a traced chain and a warning.
+            p.click('[data-k="nav:matrix"]')
+            p.wait_for('!!document.querySelector("#mx-board .note")', timeout=8)
+            if p.eval('document.querySelector(\'[data-k="mxf:done"]\').getAttribute("aria-pressed")') != 'true':
+                p.click('[data-k="mxf:done"]')
+            p.wait_for('!!document.querySelector("#mx-board .note.done")', timeout=6)
+            failures += self.scan(f'{theme}/matrix')
+            p.click(f'#mx-board .note[data-key="t{a["id"]}"] .note-title')
+            p.wait_for('!!document.querySelector("#mx-board .note.dim")')
+            failures += self.scan(f'{theme}/matrix-traced')
+            if p.eval('!!document.querySelector(".warning")'):
+                p.click('.warning')
+                failures += self.scan(f'{theme}/matrix-warning')
+            failures += self.focus_scan(f'{theme}/matrix', '.mx button, .mx [tabindex]')
+            p.eval('TT.matrix.render()')
+            mid = p.eval('(() => { const path = document.querySelector("#mx-board .link-hit"); const l = path.getTotalLength();'
+                         ' const pt = path.getPointAtLength(l / 2); const r = document.querySelector("#mx-board").getBoundingClientRect();'
+                         ' return [r.left + pt.x, r.top + pt.y]; })()')
+            p.click_at(*mid)
+            p.wait_for('!!document.querySelector(".mx-linkbar")')
+            failures += self.scan(f'{theme}/matrix-link')
+            # Lightbox and banners.
+            p.click('[data-k="nav:all"]')
+            self.open_editor('Overdue high task')
+            p.eval('TT.$("#lightbox img").src = %s; TT.$("#lightbox").hidden = false' % js(self.image_url))
+            failures += self.scan(f'{theme}/lightbox')
+            p.eval('TT.$("#lightbox").hidden = true')
+            for kind in ('', 'info'):
+                p.eval('(() => { const b = TT.$("#banner"); b.textContent = "Banner text for the contrast check"; b.className = "banner %s"; b.hidden = false; })()' % kind)
+                failures += self.scan(f'{theme}/banner {kind or "offline"}')
+            p.eval('TT.$("#banner").hidden = true')
+            p.key('Escape')
+        self.maxDiff = None
+        self.assertEqual(failures, [], "\n".join(failures))
 
 
 class UpdateTests(UICase):

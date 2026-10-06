@@ -610,6 +610,77 @@ class MatrixTests(StoreCase):
         self.assertEqual(t['subtasks'][-1]['matrix'], [0.7, 0.7])
 
 
+class ImportTests(StoreCase):
+    def source(self):
+        src_path = os.path.join(self.dir, 'source.db')
+        src = db.Store(src_path)
+        src.open()
+        a = src.create_task('Write report', description='see ![x](/images/0123456789abcdef0123456789abcdef.png)',
+                            labels=['work', 'home'], due_at='2026-10-01', priority='high')
+        a, sids = src.add_subtasks(a['id'], [{'title': 'Draft', 'labels': ['work'], 'notes': 'n1', 'due_at': '2026-10-02'},
+                                             {'title': 'Review', 'done': True}])
+        b = src.create_task('Second')
+        src.update_task(b['id'], {'status': 'in_progress'})
+        src.set_matrix([{'key': f"t{a['id']}", 'matrix': [0.7, 0.8]}, {'key': f's{sids[0]}', 'matrix': [0.6, 0.6]}])
+        src.add_dep(f's{sids[0]}', f"t{b['id']}")
+        src.update_label(next(l['id'] for l in src.list_labels() if l['name'] == 'home'), color='#123456')
+        data = json.loads(json.dumps(src.export()))
+        src.close()
+        return data
+
+    def test_round_trip_keeps_everything_and_maps_ids(self):
+        data = self.source()
+        self.store.create_task('Already here')            # shifts the ids
+        summary = self.store.import_data(data)
+        self.assertEqual(summary, {'tasks': 2, 'skipped': 0, 'invalid': 0, 'subtasks': 2, 'labels': 2,
+                                   'dependencies': 1, 'dependencies_skipped': 0})
+        t = next(x for x in self.store.list_tasks(view='all') if x['title'] == 'Write report')
+        full = self.store.get_task(t['id'])
+        src = next(x for x in data['tasks'] if x['title'] == 'Write report')
+        for key in ('created_at', 'updated_at', 'due_at', 'priority', 'status', 'description', 'matrix'):
+            self.assertEqual(full[key], src[key], key)
+        self.assertEqual([l['name'] for l in full['labels']], ['work', 'home'])
+        self.assertEqual(next(l['color'] for l in self.store.list_labels() if l['name'] == 'home'), '#123456')
+        subs = [(x['title'], x['done'], x['due_at'], x['notes'], [l['name'] for l in x['labels']], x['matrix'], x['created_at'])
+                for x in full['subtasks']]
+        self.assertEqual(subs[0][:6], ('Draft', False, '2026-10-02', 'n1', ['work'], [0.6, 0.6]))
+        self.assertEqual(subs[1][:2], ('Review', True))
+        self.assertEqual(subs[0][6], src['subtasks'][0]['created_at'])
+        deps = self.store.list_deps()
+        self.assertEqual(len(deps), 1)
+        self.assertEqual((deps[0]['before_title'], deps[0]['after_title']), ('Draft', 'Second'))
+        self.assertEqual(self.store.due_reminders(NOW), [], 'old targets do not fire a storm of reminders')
+        self.assertEqual([x['title'] for x in self.store.list_tasks(q='review')], ['Write report'])
+
+    def test_importing_twice_adds_nothing(self):
+        data = self.source()
+        self.store.import_data(data)
+        before = self.store.counts()
+        summary = self.store.import_data(data)
+        self.assertEqual((summary['tasks'], summary['skipped'], summary['dependencies']), (0, 2, 0))
+        self.assertEqual(self.store.counts(), before)
+
+    def test_lenient_formats_and_bad_entries(self):
+        summary = self.store.import_data({'tasks': [
+            {'id': 'a', 'title': 'Variant', 'status': 'In Progress', 'priority': 'H', 'labels': [{'name': 'two words'}],
+             'mx': 0.2, 'my': 0.3, 'created_at': '2025-01-01 10:00:00', 'due': '2025-02-01 09:30:00',
+             'subtasks': [{'id': 'x', 'title': 'child', 'labels': ['two-words', 'stranger'], 'position': 1},
+                          {'id': 'y', 'title': 'first', 'position': 0}, {'title': ''}]},
+            {'title': ''}, 'junk', {'title': 'Done one', 'done': True}],
+            'deps': [{'before_task_id': 'a', 'after_subtask_id': 'x'}, {'before': 'tnope', 'after': 'ta'}]})
+        self.assertEqual((summary['tasks'], summary['subtasks'], summary['invalid'], summary['dependencies'],
+                          summary['dependencies_skipped']), (2, 2, 3, 1, 1))
+        v = next(x for x in self.store.list_tasks(view='all') if x['title'] == 'Variant')
+        self.assertEqual((v['status'], v['priority'], v['matrix'], v['created_at'], v['due_at']),
+                         ('in_progress', 'high', [0.2, 0.3], '2025-01-01T10:00:00', '2025-02-01T09:30'))
+        self.assertEqual([x['title'] for x in v['subtasks']], ['first', 'child'])
+        self.assertEqual([l['name'] for l in v['subtasks'][1]['labels']], ['two-words'], 'only the task\'s labels')
+        self.assertEqual(next(x for x in self.store.list_tasks(view='all') if x['title'] == 'Done one')['status'], 'done')
+        for bad in ([], {'tasks': 'x'}, 'text', {'labels': []}):
+            with self.assertRaises(db.ValidationError):
+                self.store.import_data(bad)
+
+
 PHASE2_SCHEMA = """
 CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'open', priority TEXT NOT NULL DEFAULT 'medium', created_at TEXT NOT NULL,
@@ -895,6 +966,15 @@ class ServerTests(unittest.TestCase):
             st, res, _ = self.req('POST', '/api/deps', body)
             self.assertEqual(st, 400, body)
         st, res, _ = self.req('POST', '/api/matrix', {'items': 'x'})
+        self.assertEqual(st, 400)
+
+    def test_import_api_reports_missing_images(self):
+        export = {'tasks': [{'title': 'With picture', 'created_at': '2024-01-01T00:00:00',
+                             'description': '![p](/images/0123456789abcdef0123456789abcdef.png)'}]}
+        st, res, _ = self.req('POST', '/api/import', export)
+        self.assertEqual(st, 200, res)
+        self.assertEqual((res['summary']['tasks'], res['summary']['missing_images']), (1, 1))
+        st, res, _ = self.req('POST', '/api/import', {'nothing': 1})
         self.assertEqual(st, 400)
 
     def test_images(self):
