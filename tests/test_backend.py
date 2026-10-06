@@ -183,7 +183,7 @@ class ViewTests(StoreCase):
         self.assertEqual(self.titles(view='open', sort='priority')[0], 'later')
         self.assertEqual(self.titles(view='open', sort='priority')[-1], 'no date')
         counts = s.meta()['counts']
-        self.assertEqual(counts, {'open': 6, 'overdue': 2, 'today': 2, 'week': 3, 'nodate': 1, 'done': 1, 'all': 7})
+        self.assertEqual(counts, {'open': 6, 'overdue': 2, 'today': 2, 'week': 3, 'nodate': 1, 'done': 1, 'all': 7, 'do': 0})
         for bad in (dict(view='soon'), dict(sort='random'), dict(match='some')):
             with self.assertRaises(db.ValidationError):
                 s.list_tasks(**bad)
@@ -522,6 +522,94 @@ class SubtaskDetailTests(StoreCase):
             self.store.add_subtasks(t['id'], [{'title': 'bad', 'labels': ['nope']}])
 
 
+class MatrixTests(StoreCase):
+    def setUp(self):
+        super().setUp()
+        self.a = self.store.create_task('A', priority='low')
+        self.b = self.store.create_task('B')
+        self.c = self.store.create_task('C')
+        _, self.subs = self.store.add_subtasks(self.b['id'], ['b1', 'b2'])
+        self.ka, self.kb, self.kc = f"t{self.a['id']}", f"t{self.b['id']}", f"t{self.c['id']}"
+        self.ks = f"s{self.subs[0]}"
+
+    def test_positions_priority_and_do_count(self):
+        tasks = self.store.set_matrix([{'key': self.ka, 'matrix': [0.9, 0.8], 'priority': 'high'},
+                                       {'key': self.ks, 'matrix': [0.6, 0.55]}])
+        self.assertEqual(sorted(t['title'] for t in tasks), ['A', 'B'])
+        a = self.store.get_task(self.a['id'])
+        self.assertEqual((a['matrix'], a['priority']), ([0.9, 0.8], 'high'))
+        self.assertEqual(self.store.get_task(self.b['id'])['subtasks'][0]['matrix'], [0.6, 0.55])
+        self.assertEqual(self.store.meta()['counts']['do'], 2)
+        self.store.set_matrix([{'key': self.ka, 'matrix': None}])
+        self.assertIsNone(self.store.get_task(self.a['id'])['matrix'])
+        self.assertEqual(self.store.meta()['counts']['do'], 1)
+        for bad in ([], [{'key': self.ks, 'matrix': [0.5, 0.5], 'priority': 'high'}],
+                    [{'key': 'q1', 'matrix': None}], [{'key': self.ka, 'matrix': [0.5]}],
+                    [{'key': self.ka, 'matrix': [-0.1, 0.5]}], [{'key': self.ka, 'matrix': ['a', 0.5]}],
+                    [{'key': self.ka, 'matrix': [True, 0.5]}], [{'key': self.ka}],
+                    [{'key': self.ka, 'matrix': None, 'extra': 1}], [{'key': self.ka, 'matrix': None, 'priority': 'max'}]):
+            with self.subTest(bad=str(bad)[:60]):
+                with self.assertRaises(db.ValidationError):
+                    self.store.set_matrix(bad)
+        with self.assertRaises(db.NotFound):
+            self.store.set_matrix([{'key': 't99999', 'matrix': None}])
+
+    def test_dependencies_self_loops_duplicates(self):
+        s = self.store
+        dep_id, created, deps = s.add_dep(self.ka, self.ks)
+        self.assertTrue(created)
+        self.assertEqual((deps[0]['before'], deps[0]['after'], deps[0]['before_title']), (self.ka, self.ks, 'A'))
+        self.assertEqual(s.add_dep(self.ka, self.ks)[:2], (dep_id, False), 'a duplicate is a no-op')
+        s.add_dep(self.ks, self.kc)
+        with self.assertRaises(db.ValidationError) as cm:
+            s.add_dep(self.kc, self.ka)
+        self.assertIn('loop', str(cm.exception))
+        with self.assertRaises(db.ValidationError):
+            s.add_dep(self.ka, self.ka)
+        with self.assertRaises(db.NotFound):
+            s.add_dep(self.ka, 't99999')
+        with self.assertRaises(db.ValidationError):
+            s.add_dep(self.ka, 'x1')
+        self.assertEqual(len(s.list_deps()), 2)
+        s.update_task(self.a['id'], {'status': 'done'})
+        self.assertTrue(next(d for d in s.list_deps() if d['before'] == self.ka)['before_done'])
+        s.update_task(self.b['id'], {'status': 'done'})
+        self.assertTrue(next(d for d in s.list_deps() if d['before'] == self.ks)['before_done'],
+                        'a subtask of a done task counts as done')
+
+    def test_links_live_only_while_both_items_exist(self):
+        s = self.store
+        s.add_dep(self.ka, self.ks)
+        s.add_dep(self.kb, self.kc)
+        s.delete_subtask(self.subs[0])
+        self.assertEqual([(d['before'], d['after']) for d in s.list_deps()], [(self.kb, self.kc)])
+        s.delete_task(self.c['id'])
+        self.assertEqual(s.list_deps(), [])
+        with s.write() as c:
+            with self.assertRaises(sqlite3.IntegrityError):
+                c.execute('INSERT INTO dependencies(before_task_id, before_subtask_id, after_task_id, created_at) '
+                          'VALUES (?, ?, ?, ?)', (self.a['id'], self.subs[1], self.b['id'], 'x'))
+            with self.assertRaises(sqlite3.IntegrityError):
+                c.execute('INSERT INTO dependencies(before_task_id, after_task_id, created_at) VALUES (?, ?, ?)',
+                          (99999, self.b['id'], 'x'))
+        did, _, _ = s.add_dep(self.ka, self.kb)
+        self.assertEqual(s.delete_dep(did), [])
+        with self.assertRaises(db.NotFound):
+            s.delete_dep(did)
+
+    def test_export_and_restore_keep_positions(self):
+        self.store.set_matrix([{'key': self.ka, 'matrix': [0.1, 0.2]}, {'key': self.ks, 'matrix': [0.3, 0.4]}])
+        self.store.add_dep(self.ka, self.ks)
+        data = self.store.export()
+        a = next(t for t in data['tasks'] if t['title'] == 'A')
+        b = next(t for t in data['tasks'] if t['title'] == 'B')
+        self.assertEqual((a['matrix'], b['subtasks'][0]['matrix']), ([0.1, 0.2], [0.3, 0.4]))
+        self.assertEqual(data['dependencies'][0]['before'], self.ka)
+        self.assertNotIn('before_title', data['dependencies'][0])
+        t, new = self.store.add_subtasks(self.b['id'], [{'title': 'restored', 'matrix': [0.7, 0.7]}])
+        self.assertEqual(t['subtasks'][-1]['matrix'], [0.7, 0.7])
+
+
 PHASE2_SCHEMA = """
 CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'open', priority TEXT NOT NULL DEFAULT 'medium', created_at TEXT NOT NULL,
@@ -554,7 +642,11 @@ class SubtaskMigrationTests(unittest.TestCase):
             self.assertEqual((t['subtasks'][0]['due_at'], t['subtasks'][0]['notes']), (None, ''))
             with s.read() as c:
                 names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
+                cols = {r[1] for r in c.execute('PRAGMA table_info(subtasks)')}
+                tcols = {r[1] for r in c.execute('PRAGMA table_info(tasks)')}
+                self.assertTrue(c.execute("SELECT 1 FROM sqlite_master WHERE name = 'dependencies'").fetchone())
             self.assertEqual(names, {n for n, _ in db.TRIGGERS})
+            self.assertTrue({'mx', 'my', 'notes', 'due_at'} <= cols and {'mx', 'my'} <= tcols)
             t = s.update_subtask(t['subtasks'][0]['id'], {'notes': 'now possible'})
             self.assertEqual(t['subtasks'][0]['notes'], 'now possible')
             s.close()
@@ -782,6 +874,28 @@ class ServerTests(unittest.TestCase):
         for body in ({'labels': ['beta']}, {'due_at': 'tomorrow'}, {'notes': None}, {'labels': [1]}):
             st, data, _ = self.req('PATCH', f'/api/subtasks/{sid}', body)
             self.assertEqual(st, 400, (body, data))
+
+    def test_matrix_and_deps_api(self):
+        st, a, _ = self.req('POST', '/api/tasks', {'title': 'first'})
+        st, b, _ = self.req('POST', '/api/tasks', {'title': 'second'})
+        st, res, _ = self.req('POST', '/api/matrix', {'items': [{'key': f't{a["id"]}', 'matrix': [0.8, 0.9]}]})
+        self.assertEqual((st, res['tasks'][0]['matrix']), (200, [0.8, 0.9]))
+        st, res, _ = self.req('POST', '/api/deps', {'before': f't{a["id"]}', 'after': f't{b["id"]}'})
+        self.assertEqual((st, res['created']), (201, True))
+        st, res, _ = self.req('POST', '/api/deps', {'before': f't{a["id"]}', 'after': f't{b["id"]}'})
+        self.assertEqual((st, res['created']), (200, False))
+        st, res, _ = self.req('POST', '/api/deps', {'before': f't{b["id"]}', 'after': f't{a["id"]}'})
+        self.assertEqual(st, 400)
+        self.assertIn('loop', res['error'])
+        st, res, _ = self.req('GET', '/api/deps')
+        dep = next(d for d in res['deps'] if d['before'] == f't{a["id"]}')
+        st, res, _ = self.req('DELETE', f'/api/deps/{dep["id"]}')
+        self.assertEqual(st, 200)
+        for body in ({'before': 't1'}, {'before': 't1', 'after': 5}, {'before': 'nope', 'after': 't1'}):
+            st, res, _ = self.req('POST', '/api/deps', body)
+            self.assertEqual(st, 400, body)
+        st, res, _ = self.req('POST', '/api/matrix', {'items': 'x'})
+        self.assertEqual(st, 400)
 
     def test_images(self):
         st, data, _ = self.req('POST', '/api/images', raw=PNG, headers={'Content-Type': 'image/png'})

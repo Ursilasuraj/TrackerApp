@@ -43,6 +43,7 @@ class UICase(unittest.TestCase):
     def setUp(self):
         self.srv = AppServer(**self.server_args())
         self.page = None
+        self.expected_http_errors = 0
 
     def server_args(self):
         return {}
@@ -51,6 +52,10 @@ class UICase(unittest.TestCase):
         errors = []
         if self.page:
             errors = [e for e in self.page.console_errors() if 'favicon' not in e]
+            # A refused request (e.g. a loop) is logged by the browser as a failed resource.
+            failed = [e for e in errors if 'Failed to load resource' in e and 'status of 400' in e]
+            if failed and len(failed) <= self.expected_http_errors:
+                errors = [e for e in errors if e not in failed]
             self.browser.close_page(self.page)
         self.srv.cleanup()
         self.assertEqual(errors, [], 'console errors')
@@ -861,6 +866,251 @@ class SubtaskDetailTests(UICase):
         home = next(l['id'] for l in self.api('GET', '/api/meta')['labels'] if l['name'] == 'home')
         p.click(f'[data-k="lbl:{home}:name"]')
         p.wait_for('document.querySelectorAll(".mini-sub").length === 1 && document.querySelector(".mini-sub label").textContent === "Music"')
+
+
+class MatrixTests(UICase):
+    def open_matrix(self):
+        p = self.open(self.srv.url + '#matrix')
+        p.wait_for('!!document.querySelector("#mx-board")', timeout=8)
+        # Wait until the board shows every placed item the server knows about.
+        p.wait_for('TT.S.tasks.reduce((n, t) => n + (t.matrix ? 1 : 0) + (t.subtasks || []).filter(s => s.matrix).length, 0)'
+                   ' === document.querySelectorAll("#mx-board .note").length', timeout=8)
+        return p
+
+    def wait_mx(self):
+        self.page.wait_for('TT.matrixBusy() === false && TT.net.inflight === 0 && TT.Q.pending === 0', timeout=8)
+        time.sleep(0.2)
+
+    def board_xy(self, x, y):
+        r = self.page.rect('#mx-board')
+        return r['x'] + x * r['w'], r['y'] + (1 - y) * r['h']
+
+    def note(self, key):
+        return f'#mx-board .note[data-key="{key}"]'
+
+    def title_xy(self, key):
+        return self.page.center(self.note(key) + ' .note-title')
+
+    def place(self, items):
+        self.api('POST', '/api/matrix', {'items': items}, expect=200)
+
+    def pos(self, tid):
+        return self.server_task(tid)['matrix']
+
+    def test_drag_from_tray_and_priority_follows_placement(self):
+        low = self.task('Low one', priority='low')
+        med = self.task('Medium one')
+        p = self.open_matrix()
+        p.wait_for('document.querySelectorAll(".mx-tray .tray-item").length === 2')
+        x0, y0 = p.center(f'.tray-item[data-key="t{low["id"]}"] .tray-title')
+        x1, y1 = self.board_xy(0.75, 0.75)
+        p.drag(x0, y0, x1, y1)
+        self.wait_mx()
+        st = self.server_task(low['id'])
+        self.assertEqual(st['priority'], 'high', 'Low dropped in the top half becomes High')
+        self.assertTrue(st['matrix'][0] > 0.6 and st['matrix'][1] > 0.6, st['matrix'])
+        p.wait_for('Array.from(document.querySelectorAll(".toast")).some(t => t.textContent.includes("High priority"))')
+        x0, y0 = p.center(f'.tray-item[data-key="t{med["id"]}"] .tray-title')
+        x1, y1 = self.board_xy(0.3, 0.7)
+        p.drag(x0, y0, x1, y1)
+        self.wait_mx()
+        self.assertEqual(self.server_task(med['id'])['priority'], 'medium', 'already important: unchanged')
+        # Across the middle line (top -> bottom) sets Low; within a half nothing changes.
+        x0, y0 = self.title_xy(f't{low["id"]}')
+        x1, y1 = self.board_xy(0.75, 0.25)
+        p.drag(x0, y0, x1, y1)
+        self.wait_mx()
+        self.assertEqual(self.server_task(low['id'])['priority'], 'low')
+        x0, y0 = self.title_xy(f't{low["id"]}')
+        x1, y1 = self.board_xy(0.25, 0.3)
+        p.drag(x0, y0, x1, y1)
+        self.wait_mx()
+        st = self.server_task(low['id'])
+        self.assertEqual(st['priority'], 'low')
+        self.assertLess(st['matrix'][0], 0.5)
+        # Onto the tray: back to unsorted.
+        x0, y0 = self.title_xy(f't{low["id"]}')
+        x1, y1 = p.center('.mx-tray-head h2')
+        p.drag(x0, y0, x1, y1 + 60)
+        self.wait_mx()
+        self.assertIsNone(self.pos(low['id']))
+
+    def test_suggestions_place_all_and_keyboard(self):
+        today = time.strftime('%Y-%m-%d')
+        a = self.task('Urgent important', due_at=today, priority='high')
+        b = self.task('Someday', priority='low')
+        c = self.task('Later important', due_at='2031-01-01')
+        p = self.open_matrix()
+        p.wait_for('document.querySelectorAll(".mx-tray .tray-item").length === 3')
+        p.click(f'.tray-item[data-key="t{a["id"]}"] .suggest-chip')
+        self.wait_mx()
+        self.assertEqual(p.eval(f'TT.P.quadrantOf(TT.taskById({a["id"]}).matrix)'), 'do')
+        p.click('[data-k="mx:place-all"]')
+        self.wait_mx()
+        quads = p.eval('TT.S.tasks.map(t => t.title + ":" + TT.P.quadrantOf(t.matrix) + ":" + t.priority).sort()')
+        self.assertEqual(quads, ['Later important:schedule:medium', 'Someday:eliminate:low', 'Urgent important:do:high'])
+        # Keyboard: arrows move by 2 % (Shift 10 %), Delete puts back, Enter in the tray takes the suggestion.
+        before = self.pos(b['id'])
+        p.eval(f'document.querySelector(\'{self.note("t" + str(b["id"]))}\').focus()')
+        p.key('ArrowRight')
+        self.wait_mx()
+        after = self.pos(b['id'])
+        self.assertAlmostEqual(after[0], round(before[0] + 0.02, 3), places=3)
+        p.key('ArrowUp', 'shift')
+        self.wait_mx()
+        self.assertAlmostEqual(self.pos(b['id'])[1], round(before[1] + 0.1, 3), places=3)
+        self.assertEqual(p.active(), f'mx:t{b["id"]}', 'focus stays on the moved note')
+        p.key('Delete')
+        self.wait_mx()
+        self.assertIsNone(self.pos(b['id']))
+        p.eval(f'document.querySelector(\'.tray-item[data-key="t{b["id"]}"]\').focus()')
+        p.key('Enter')
+        self.wait_mx()
+        self.assertEqual(p.eval(f'TT.P.quadrantOf(TT.taskById({b["id"]}).matrix)'), 'eliminate')
+        # Enter opens the editor, which floats over the board.
+        p.eval(f'document.querySelector(\'{self.note("t" + str(c["id"]))}\').focus()')
+        p.key('Enter')
+        p.wait_for('!!document.querySelector("#editor:not([hidden]) .ed-title")')
+        self.assertEqual(p.eval('getComputedStyle(document.querySelector("#editor")).position'), 'fixed')
+        p.key('Escape')
+        p.wait_for('document.querySelector("#editor").hidden')
+
+    def test_links_trace_and_remove(self):
+        a = self.task('A first')
+        b = self.task('B second')
+        c = self.task('C third')
+        d = self.task('D alone')
+        self.place([{'key': f't{a["id"]}', 'matrix': [0.15, 0.85]}, {'key': f't{b["id"]}', 'matrix': [0.45, 0.65]},
+                    {'key': f't{c["id"]}', 'matrix': [0.8, 0.85]}, {'key': f't{d["id"]}', 'matrix': [0.8, 0.2]}])
+        p = self.open_matrix()
+        ka, kb, kc, kd = (f't{x["id"]}' for x in (a, b, c, d))
+        for src, dst in ((ka, kb), (kb, kc)):
+            x0, y0 = p.center(self.note(src) + ' .note-link')
+            x1, y1 = self.title_xy(dst)
+            p.drag(x0, y0, x1, y1)
+            time.sleep(0.3)
+        p.wait_for('document.querySelectorAll("#mx-board .link").length === 2')
+        self.assertEqual(len(self.api('GET', '/api/deps')['deps']), 2)
+        self.assertIn('waits for 1', p.eval(f'document.querySelector(\'{self.note(kc)}\').textContent'))
+        # A loop is refused with a message; dropping on itself does nothing.
+        self.expected_http_errors = 1
+        x0, y0 = p.center(self.note(kc) + ' .note-link')
+        x1, y1 = self.title_xy(ka)
+        p.drag(x0, y0, x1, y1)
+        p.wait_for('Array.from(document.querySelectorAll(".toast.error")).some(t => t.textContent.includes("loop"))')
+        x0, y0 = p.center(self.note(kd) + ' .note-link')
+        x1, y1 = self.title_xy(kd)
+        p.drag(x0, y0, x1, y1)
+        p.wait_for('Array.from(document.querySelectorAll(".toast.error")).some(t => t.textContent.includes("cannot wait for itself"))')
+        self.assertEqual(len(self.api('GET', '/api/deps')['deps']), 2)
+        # Clicking a note traces its chain; the rest dims.
+        p.click(self.note(kb) + ' .note-title')
+        p.wait_for('document.querySelectorAll("#mx-board .note.traced").length === 3')
+        self.assertIn('dim', p.eval(f'document.querySelector(\'{self.note(kd)}\').className'))
+        p.key('Escape')
+        p.wait_for('document.querySelectorAll("#mx-board .note.dim").length === 0')
+        # Done first item: with "Show done" its arrow turns dashed.
+        p.click('[data-k="mxf:done"]')
+        p.click(self.note(ka) + ' .note-check')
+        p.wait_for('!!document.querySelector("#mx-board .link.done")', timeout=6)
+        self.assertNotIn('waits for', p.eval(f'document.querySelector(\'{self.note(kb)}\').textContent'))
+        # Select an arrow, remove it with the button; Delete removes a selected one too.
+        mid = p.eval('(() => { const path = document.querySelector("#mx-board .link:not(.done) .link-hit"); const l = path.getTotalLength();'
+                     ' const pt = path.getPointAtLength(l / 2); const r = document.querySelector("#mx-board").getBoundingClientRect();'
+                     ' return [r.left + pt.x, r.top + pt.y]; })()')
+        p.click_at(*mid)
+        p.wait_for('!!document.querySelector("[data-k=\\"mx:unlink\\"]")')
+        p.click('[data-k="mx:unlink"]')
+        p.wait_for('document.querySelectorAll("#mx-board .link").length === 0 || document.querySelectorAll("#mx-board .link").length === 1')
+        self.wait_mx()
+        self.assertEqual(len(self.api('GET', '/api/deps')['deps']), 1)
+        mid = p.eval('(() => { const path = document.querySelector("#mx-board .link-hit"); const l = path.getTotalLength();'
+                     ' const pt = path.getPointAtLength(l / 2); const r = document.querySelector("#mx-board").getBoundingClientRect();'
+                     ' return [r.left + pt.x, r.top + pt.y]; })()')
+        p.click_at(*mid)
+        p.wait_for('!!document.querySelector("[data-k=\\"mx:unlink\\"]")')
+        p.key('Delete')
+        p.wait_for('document.querySelectorAll("#mx-board .link").length === 0')
+        self.assertEqual(self.api('GET', '/api/deps')['deps'], [])
+
+    def test_today_strip_warnings_and_filters(self):
+        today = time.strftime('%Y-%m-%d')
+        keys = []
+        for i in range(9):
+            t = self.task(f'Do {i}', due_at=today if i < 3 else None)
+            keys.append(t)
+        late = self.task('Late in schedule', due_at='2020-01-01')
+        parent = self.task('Parent', labels=['red'])
+        task = self.api('POST', f'/api/tasks/{parent["id"]}/subtasks', {'items': ['Inherits red']}, expect=201)
+        sid = task['subtasks'][0]['id']
+        items = [{'key': f't{t["id"]}', 'matrix': [0.55 + i * 0.04, 0.6 + (i % 3) * 0.1]} for i, t in enumerate(keys)]
+        items += [{'key': f't{late["id"]}', 'matrix': [0.2, 0.8]}, {'key': f's{sid}', 'matrix': [0.2, 0.3]}]
+        self.place(items)
+        p = self.open_matrix()
+        p.wait_for('document.querySelectorAll(".today-item").length === 6')
+        self.assertIn('+3 more', p.eval('document.querySelector(".mx-today").textContent'))
+        warnings = p.eval('Array.from(document.querySelectorAll(".warning")).map(w => w.textContent)')
+        self.assertTrue(any('more than 8' in w for w in warnings), warnings)
+        self.assertTrue(any('due by today but sits in Schedule' in w for w in warnings), warnings)
+        p.click('[data-k="warn:late"]')
+        p.wait_for(f'document.querySelector(\'{self.note("t" + str(late["id"]))}\').classList.contains("traced")')
+        self.assertTrue(p.eval(f'document.querySelector(\'{self.note("t" + str(keys[0]["id"]))}\').classList.contains("dim")'))
+        # A Today item selects its note.
+        p.click('.today-item')
+        self.assertTrue(p.active().startswith('mx:t'))
+        # Filters.
+        p.click('[data-k="mxf:tasks"]')
+        p.wait_for('document.querySelectorAll("#mx-board .note.is-task").length === 0 && document.querySelectorAll("#mx-board .note.is-sub").length === 1')
+        p.click('[data-k="mxf:tasks"]')
+        p.click('[data-k="mxf:subs"]')
+        p.wait_for('document.querySelectorAll("#mx-board .note.is-sub").length === 0')
+        p.click('[data-k="mxf:subs"]')
+        # The label filter: a subtask without labels counts with its task's labels.
+        red = next(l['id'] for l in self.api('GET', '/api/meta')['labels'] if l['name'] == 'red')
+        p.click(f'[data-k="lbl:{red}:name"]')
+        p.wait_for('document.querySelectorAll("#mx-board .note").length === 1 && !!document.querySelector("#mx-board .note.is-sub")')
+        p.click('[data-k="side:clear"]')
+        # Show done: done notes appear, muted.
+        self.api('PATCH', f'/api/tasks/{keys[0]["id"]}', {'status': 'done'})
+        p.wait_for(f'!document.querySelector(\'{self.note("t" + str(keys[0]["id"]))}\')', timeout=6)
+        p.click('[data-k="mxf:done"]')
+        p.wait_for(f'!!document.querySelector(\'{self.note("t" + str(keys[0]["id"]))}.done\')', timeout=6)
+
+    def test_double_click_subtask_opens_its_task_on_that_subtask(self):
+        t = self.task('Holder')
+        task = self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['first', 'second']}, expect=201)
+        sid = task['subtasks'][1]['id']
+        self.place([{'key': f's{sid}', 'matrix': [0.7, 0.7]}])
+        p = self.open_matrix()
+        p.dblclick(self.note(f's{sid}') + ' .note-title')
+        p.wait_for(f'document.activeElement && document.activeElement.dataset.k === "s{sid}:title"', timeout=6)
+        self.assertEqual(p.eval('TT.E.task.title'), 'Holder')
+
+    def test_drag_keeps_working_while_the_page_refreshes(self):
+        a = self.task('Dragged')
+        other = self.task('Background')
+        self.place([{'key': f't{a["id"]}', 'matrix': [0.2, 0.8]}])
+        p = self.open_matrix()
+        x0, y0 = self.title_xy(f't{a["id"]}')
+        x1, y1 = self.board_xy(0.3, 0.7)
+        p.move(x0, y0)
+        p.mouse('mousePressed', x0, y0, buttons=1)
+        for i in range(1, 6):
+            p.mouse('mouseMoved', x0 + (x1 - x0) * i / 10, y0 + (y1 - y0) * i / 10, buttons=1)
+            time.sleep(0.03)
+        self.api('PATCH', f'/api/tasks/{other["id"]}', {'title': 'Background changed'})
+        time.sleep(2.0)   # a poll notices the change and refreshes meanwhile
+        for i in range(6, 11):
+            p.mouse('mouseMoved', x0 + (x1 - x0) * i / 10, y0 + (y1 - y0) * i / 10, buttons=1)
+            time.sleep(0.03)
+        p.mouse('mouseReleased', x1, y1)
+        self.wait_mx()
+        # The note moved with the pointer (it was grabbed at its title, not its centre).
+        r = p.rect('#mx-board')
+        pos = self.pos(a['id'])
+        self.assertAlmostEqual(pos[0], 0.2 + (x1 - x0) / r['w'], delta=0.01)
+        self.assertAlmostEqual(pos[1], 0.8 - (y1 - y0) / r['h'], delta=0.01)
+        p.wait_for('document.querySelector(".mx-tray").textContent.includes("Background changed")', timeout=6)
 
 
 class UpdateTests(UICase):

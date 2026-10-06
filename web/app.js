@@ -16,7 +16,7 @@
   const MD = window.TTMarkdown;
   const ROOT = document.documentElement;
   const BOOT = { api: Number(ROOT.dataset.api) || 0, build: ROOT.dataset.build || '' };
-  const CLIENT_API = 3;            // the server API this page is written for
+  const CLIENT_API = 4;            // the server API this page is written for
   const FEATURE_API = { subtasks: 2, subtaskDetails: 3 };   // feature -> minimum server API
   const KEEPALIVE_BUDGET = 60000;  // Chromium allows 64 KB of keepalive bodies in flight
   const STATUS_NAMES = { open: 'Open', in_progress: 'In progress', done: 'Done' };
@@ -367,7 +367,11 @@
   }
 
   // Later phases keep optimistic local data while their writes are queued.
-  function mergeLocal(tasks) { return TT.mergeLocal ? TT.mergeLocal(tasks) : tasks; }
+  function mergeLocal(tasks) {
+    let out = TT.mergeLocal ? TT.mergeLocal(tasks) : tasks;
+    if (TT.mergeMatrixLocal) out = TT.mergeMatrixLocal(out);
+    return out;
+  }
 
   /** A full task arrived from the server (after a write): update everything. */
   function applyTask(task) {
@@ -1605,7 +1609,7 @@
     }
     if (st.changes === net.lastChanges) return;
     // Own writes still on the wire: their numbers are not known yet.
-    if (net.inflight > 0 || (TT.subtaskBusy && TT.subtaskBusy())) return;
+    if (net.inflight > 0 || (TT.subtaskBusy && TT.subtaskBusy()) || (TT.matrixBusy && TT.matrixBusy())) return;
     let external = false;
     for (let n = net.lastChanges + 1; n <= st.changes; n++) {
       if (!net.own.has(n)) { external = true; break; }
@@ -1715,7 +1719,7 @@
         focusQuickAdd();
       } else if (e.key === 'Escape' && !e.defaultPrevented) {
         if (closeLightbox()) { e.preventDefault(); return; }
-        if (TT.escape && TT.escape(e)) return;
+        if (TT.escape && !$('#editor').contains(document.activeElement) && TT.escape(e)) return;
         if (S.openId) { e.preventDefault(); closeEditor(); return; }
         if ($('#search').value) { e.preventDefault(); clearSearch(); return; }
         if ($('#sidebar').classList.contains('open')) toggleMenu(false);

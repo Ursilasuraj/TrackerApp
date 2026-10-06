@@ -218,3 +218,47 @@ test('checklist conversion finds lines outside code and removes exactly them', (
   assert.deepEqual(MD.findChecklist('- [ ]   \n- [x]'), [], 'empty items are ignored');
   assert.deepEqual(MD.findChecklist('~~~\n- [ ] a\n~~~\n- [ ] b').map((i) => i.title), ['b']);
 });
+
+// ---- Eisenhower matrix rules ---------------------------------------------
+
+test('suggested placement: urgency, importance, order and spread', () => {
+  const S = (due, priority, key) => P.suggestPlacement({ key: key || 't1', due, priority }, NOW);
+  assert.equal(S('2026-10-06', 'high').quad, 'do');
+  assert.equal(S('2026-10-08', 'medium').quad, 'do', 'two days ahead is still urgent');
+  assert.equal(S('2026-10-09', 'medium').quad, 'schedule');
+  assert.equal(S('2026-10-01', 'low').quad, 'delegate', 'overdue is urgent');
+  assert.equal(S(null, 'low').quad, 'eliminate');
+  assert.equal(S(null, 'high').quad, 'schedule');
+  // Earlier dates further right, higher priority further up (same key = same spread).
+  assert.ok(S('2026-10-05', 'high').pos[0] > S('2026-10-07', 'high').pos[0]);
+  assert.ok(S('2026-10-07', 'high').pos[0] > S('2026-10-08', 'high').pos[0]);
+  assert.ok(S('2026-10-10', 'high').pos[0] > S('2026-11-20', 'high').pos[0]);
+  assert.ok(S('2026-10-06', 'high').pos[1] > S('2026-10-06', 'medium').pos[1]);
+  // Deterministic, different keys do not stack, everything stays in its quadrant.
+  assert.deepEqual(S('2026-10-06', 'high', 's9'), S('2026-10-06', 'high', 's9'));
+  assert.notDeepEqual(S('2026-10-06', 'high', 's9').pos, S('2026-10-06', 'high', 's10').pos);
+  for (let i = 0; i < 200; i++) {
+    for (const [due, prio] of [['2026-10-06', 'high'], [null, 'low'], ['2026-12-31', 'medium'], ['2026-10-07', 'low']]) {
+      const r = S(due, prio, 's' + i);
+      assert.equal(P.quadrantOf(r.pos), r.quad, JSON.stringify([due, prio, i, r]));
+    }
+  }
+});
+
+test('priority follows manual moves of task notes', () => {
+  const top = [0.7, 0.8];
+  const bottom = [0.7, 0.2];
+  assert.equal(P.priorityForMove('task', 'medium', bottom, top), 'high');
+  assert.equal(P.priorityForMove('task', 'high', top, bottom), 'low');
+  assert.equal(P.priorityForMove('task', 'medium', top, [0.2, 0.9]), null, 'within a half: unchanged');
+  assert.equal(P.priorityForMove('task', 'low', bottom, [0.1, 0.1]), null);
+  assert.equal(P.priorityForMove('sub', 'medium', bottom, top), null, 'subtasks have no priority');
+  assert.equal(P.priorityForMove('task', 'low', null, top), 'high', 'from the tray: fix a contradiction');
+  assert.equal(P.priorityForMove('task', 'medium', null, top), null);
+  assert.equal(P.priorityForMove('task', 'medium', null, bottom), 'low');
+  assert.equal(P.priorityForMove('task', 'high', bottom, top), null, 'already High');
+  assert.equal(P.quadrantOf([0.5, 0.5]), 'do');
+  assert.equal(P.quadrantOf([0.49, 0.5]), 'schedule');
+  assert.equal(P.quadrantOf([0.5, 0.49]), 'delegate');
+  assert.equal(P.quadrantOf(null), null);
+});

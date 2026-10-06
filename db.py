@@ -40,6 +40,7 @@ REMIND_DATE_ONLY_AT = '09:00'
 DATE_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})$')
 DATETIME_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$')
 COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
+KEY_RE = re.compile(r'^([ts])([1-9]\d{0,11})$')
 STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$')
 IMG_RE = re.compile(r'!\[[^\]\n]*\]\(\s*(?:/images/[^\s)]+|https?://[^\s)]+)[^)\n]*\)')
 
@@ -79,7 +80,9 @@ TABLES = [
         updated_at TEXT NOT NULL,
         due_at TEXT,
         completed_at TEXT,
-        reminded_at TEXT
+        reminded_at TEXT,
+        mx REAL,
+        my REAL
     )'''),
     ('labels', '''CREATE TABLE IF NOT EXISTS labels (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,12 +109,26 @@ TABLES = [
         completed_at TEXT,
         due_at TEXT,
         reminded_at TEXT,
-        notes TEXT NOT NULL DEFAULT ''
+        notes TEXT NOT NULL DEFAULT '',
+        mx REAL,
+        my REAL
     )'''),
     ('subtask_labels', '''CREATE TABLE IF NOT EXISTS subtask_labels (
         subtask_id INTEGER NOT NULL REFERENCES subtasks(id) ON DELETE CASCADE,
         label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
         PRIMARY KEY (subtask_id, label_id)
+    )'''),
+    # "A before B": each end is a task or a subtask; links live only while
+    # both items exist.
+    ('dependencies', '''CREATE TABLE IF NOT EXISTS dependencies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        before_task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+        before_subtask_id INTEGER REFERENCES subtasks(id) ON DELETE CASCADE,
+        after_task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+        after_subtask_id INTEGER REFERENCES subtasks(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        CHECK ((before_task_id IS NULL) != (before_subtask_id IS NULL)),
+        CHECK ((after_task_id IS NULL) != (after_subtask_id IS NULL))
     )'''),
 ]
 
@@ -121,6 +138,10 @@ ADDED_COLUMNS = [
     ('subtasks', 'due_at', 'TEXT'),
     ('subtasks', 'reminded_at', 'TEXT'),
     ('subtasks', 'notes', "TEXT NOT NULL DEFAULT ''"),
+    ('tasks', 'mx', 'REAL'),
+    ('tasks', 'my', 'REAL'),
+    ('subtasks', 'mx', 'REAL'),
+    ('subtasks', 'my', 'REAL'),
 ]
 
 INDEXES = [
@@ -128,6 +149,12 @@ INDEXES = [
     ('idx_task_labels_label', 'CREATE INDEX IF NOT EXISTS idx_task_labels_label ON task_labels(label_id)'),
     ('idx_subtasks_task', 'CREATE INDEX IF NOT EXISTS idx_subtasks_task ON subtasks(task_id, position)'),
     ('idx_subtask_labels_label', 'CREATE INDEX IF NOT EXISTS idx_subtask_labels_label ON subtask_labels(label_id)'),
+    ('idx_deps_unique', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_deps_unique ON dependencies('
+                        'ifnull(before_task_id, 0), ifnull(before_subtask_id, 0), '
+                        'ifnull(after_task_id, 0), ifnull(after_subtask_id, 0))'),
+    ('idx_deps_before_sub', 'CREATE INDEX IF NOT EXISTS idx_deps_before_sub ON dependencies(before_subtask_id)'),
+    ('idx_deps_after_task', 'CREATE INDEX IF NOT EXISTS idx_deps_after_task ON dependencies(after_task_id)'),
+    ('idx_deps_after_sub', 'CREATE INDEX IF NOT EXISTS idx_deps_after_sub ON dependencies(after_subtask_id)'),
 ]
 
 # A subtask's labels are always a subset of its task's labels. The database
@@ -229,6 +256,31 @@ def first_line(text, limit=120):
         if line:
             return line if len(line) <= limit else line[:limit - 1].rstrip() + '…'
     return ''
+
+
+def parse_key(key):
+    """'t12' -> ('t', 12) for a task, 's34' -> ('s', 34) for a subtask."""
+    m = KEY_RE.match(key) if isinstance(key, str) else None
+    if not m:
+        raise ValidationError(f'Invalid item key {str(key)[:20]!r} (use t<id> or s<id>).')
+    return m.group(1), int(m.group(2))
+
+
+def clean_matrix(value):
+    """None, or [urgency, importance] with both in 0..1."""
+    if value is None:
+        return None
+    if (not isinstance(value, list) or len(value) != 2
+            or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in value)):
+        raise ValidationError('A matrix position is [urgency, importance] with numbers from 0 to 1.')
+    x, y = float(value[0]), float(value[1])
+    if not (0 <= x <= 1 and 0 <= y <= 1):
+        raise ValidationError('Matrix positions must lie between 0 and 1.')
+    return [round(x, 4), round(y, 4)]
+
+
+def in_do(matrix):
+    return bool(matrix) and matrix[0] >= 0.5 and matrix[1] >= 0.5
 
 
 def clean_status(value):
@@ -887,11 +939,12 @@ class Store:
         return out
 
     SUBTASK_ITEM_KEYS = ('title', 'done', 'position', 'created_at', 'completed_at',
-                         'due_at', 'labels', 'notes')
+                         'due_at', 'labels', 'notes', 'matrix')
 
     def _clean_subtask_item_extra(self, item, out):
         out['due_at'] = clean_due(item.get('due_at'))
         out['notes'] = clean_notes(item.get('notes') or '')
+        out['matrix'] = clean_matrix(item.get('matrix'))
         labels = item.get('labels') or []
         if not isinstance(labels, list):
             raise ValidationError('Labels must be a list of names.')
@@ -948,6 +1001,8 @@ class Store:
                       (item.get('due_at'), rearm_value(item.get('due_at'), now), item.get('notes') or '', sid))
         if item.get('labels'):
             self._set_subtask_labels(c, sid, task_id, item['labels'])
+        if item.get('matrix'):
+            c.execute('UPDATE subtasks SET mx = ?, my = ? WHERE id = ?', (*item['matrix'], sid))
 
     def _subtask_row(self, c, sub_id):
         row = c.execute('SELECT * FROM subtasks WHERE id = ?', (sub_id,)).fetchone()
@@ -1028,6 +1083,135 @@ class Store:
                 self._fts_sync(c, task_id)
             return self._task(c, task_id)
 
+    # -- matrix ------------------------------------------------------------
+
+    def set_matrix(self, items):
+        """Place items on the matrix (or back in the tray with None). A task
+        item may also carry the priority that follows from the placement.
+        Returns the affected tasks."""
+        if not isinstance(items, list) or not items:
+            raise ValidationError('No items given.')
+        if len(items) > 5000:
+            raise ValidationError('Too many items at once.')
+        clean = []
+        for it in items:
+            if not isinstance(it, dict):
+                raise ValidationError('Each item must be an object.')
+            for key in it:
+                if key not in ('key', 'matrix', 'priority'):
+                    raise ValidationError(f'Unknown field "{key}".')
+            if 'matrix' not in it:
+                raise ValidationError('Missing field "matrix".')
+            kind, item_id = parse_key(it.get('key'))
+            prio = it.get('priority')
+            if prio is not None:
+                if kind != 't':
+                    raise ValidationError('Subtasks have no priority.')
+                prio = clean_priority(prio)
+            clean.append((kind, item_id, clean_matrix(it['matrix']), prio))
+        stamp = now_iso()
+        with self.write() as c:
+            touched = []
+            for kind, item_id, pos, prio in clean:
+                table = 'tasks' if kind == 't' else 'subtasks'
+                x, y = pos if pos else (None, None)
+                cur = c.execute(f'UPDATE {table} SET mx = ?, my = ? WHERE id = ?', (x, y, item_id))
+                if cur.rowcount == 0:
+                    raise NotFound(f'{"Task" if kind == "t" else "Subtask"} {item_id} not found.')
+                task_id = item_id if kind == 't' else c.execute(
+                    'SELECT task_id FROM subtasks WHERE id = ?', (item_id,)).fetchone()[0]
+                if prio:
+                    c.execute('UPDATE tasks SET priority = ?, updated_at = ? WHERE id = ? AND priority != ?',
+                              (prio, stamp, task_id, prio))
+                if task_id not in touched:
+                    touched.append(task_id)
+            return [self._task(c, tid, full=False) for tid in touched]
+
+    # -- dependencies ------------------------------------------------------
+
+    @staticmethod
+    def _deps(c):
+        """All links, with the title and done state of both ends (a subtask
+        counts as done when it or its task is done)."""
+        out = []
+        sql = '''
+            SELECT d.id, d.created_at,
+                   d.before_task_id, d.before_subtask_id, d.after_task_id, d.after_subtask_id,
+                   coalesce(bt.title, bs.title) AS before_title,
+                   CASE WHEN bt.id IS NOT NULL THEN bt.status = 'done'
+                        ELSE (bs.done = 1 OR bst.status = 'done') END AS before_done,
+                   coalesce(at.title, asb.title) AS after_title,
+                   CASE WHEN at.id IS NOT NULL THEN at.status = 'done'
+                        ELSE (asb.done = 1 OR ast.status = 'done') END AS after_done
+              FROM dependencies d
+              LEFT JOIN tasks bt ON bt.id = d.before_task_id
+              LEFT JOIN subtasks bs ON bs.id = d.before_subtask_id
+              LEFT JOIN tasks bst ON bst.id = bs.task_id
+              LEFT JOIN tasks at ON at.id = d.after_task_id
+              LEFT JOIN subtasks asb ON asb.id = d.after_subtask_id
+              LEFT JOIN tasks ast ON ast.id = asb.task_id
+             ORDER BY d.id'''
+        for r in c.execute(sql):
+            before = f"t{r['before_task_id']}" if r['before_task_id'] is not None else f"s{r['before_subtask_id']}"
+            after = f"t{r['after_task_id']}" if r['after_task_id'] is not None else f"s{r['after_subtask_id']}"
+            out.append({'id': r['id'], 'before': before, 'after': after, 'created_at': r['created_at'],
+                        'before_title': r['before_title'], 'after_title': r['after_title'],
+                        'before_done': bool(r['before_done']), 'after_done': bool(r['after_done'])})
+        return out
+
+    def list_deps(self):
+        with self.read() as c:
+            return self._deps(c)
+
+    @staticmethod
+    def _item_title(c, key):
+        kind, item_id = parse_key(key)
+        table = 'tasks' if kind == 't' else 'subtasks'
+        row = c.execute(f'SELECT title FROM {table} WHERE id = ?', (item_id,)).fetchone()
+        if not row:
+            raise NotFound(f'{"Task" if kind == "t" else "Subtask"} {item_id} not found.')
+        return row[0]
+
+    def add_dep(self, before, after):
+        """'before' must be finished before 'after'. Self-links and loops are
+        refused; a duplicate link is a no-op. Returns (id, created, all deps)."""
+        bkind, bid = parse_key(before)
+        akind, aid = parse_key(after)
+        if before == after:
+            raise ValidationError('An item cannot wait for itself.')
+        with self.write() as c:
+            before_title = self._item_title(c, before)
+            after_title = self._item_title(c, after)
+            deps = self._deps(c)
+            for d in deps:
+                if d['before'] == before and d['after'] == after:
+                    return d['id'], False, deps
+            following = {}
+            for d in deps:
+                following.setdefault(d['before'], []).append(d['after'])
+            stack, seen = [after], set()
+            while stack:
+                node = stack.pop()
+                if node == before:
+                    raise ValidationError(f'“{after_title}” already comes before “{before_title}”, '
+                                          'so this link would make a loop.')
+                if node in seen:
+                    continue
+                seen.add(node)
+                stack.extend(following.get(node, ()))
+            cur = c.execute(
+                'INSERT INTO dependencies(before_task_id, before_subtask_id, after_task_id, after_subtask_id, created_at) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (bid if bkind == 't' else None, bid if bkind == 's' else None,
+                 aid if akind == 't' else None, aid if akind == 's' else None, now_iso()))
+            return cur.lastrowid, True, self._deps(c)
+
+    def delete_dep(self, dep_id):
+        with self.write() as c:
+            if c.execute('DELETE FROM dependencies WHERE id = ?', (dep_id,)).rowcount == 0:
+                raise NotFound('Link not found.')
+            return self._deps(c)
+
     # -- reading tasks -----------------------------------------------------
 
     def _task(self, c, task_id, full=True):
@@ -1071,6 +1255,7 @@ class Store:
             'labels': r['labels'],
             'note1': first_line(r['notes']),
             'has_notes': bool(r['notes']),
+            'matrix': [r['mx'], r['my']] if r['mx'] is not None and r['my'] is not None else None,
         }
         if full:
             d['notes'] = r['notes']
@@ -1090,6 +1275,7 @@ class Store:
             'labels': labels,
             'snippet': snippet(desc),
             'images': image_count(desc),
+            'matrix': [row['mx'], row['my']] if row['mx'] is not None and row['my'] is not None else None,
         }
         if full:
             d['description'] = desc
@@ -1211,6 +1397,9 @@ class Store:
         if not words and not label_ids:
             return
         wanted = set(label_ids or ())
+        if words:
+            t['text_subs'] = [r['id'] for r in rows
+                              if text_matches_any(words, r['title'] + ' ' + (r['notes'] or ''))]
         hits = []
         for r in rows:
             if words and not text_matches_any(words, r['title'] + ' ' + (r['notes'] or '')):
@@ -1247,6 +1436,7 @@ class Store:
             ids = [r['id'] for r in rows]
             children = self._task_children(c, ids, full=False)
             counts = {v: 0 for v in VIEWS}
+            counts['do'] = 0
             for r in rows:
                 t = self._task_json(r, [], children.get(r['id']), now=now)
                 for v in ('open', 'overdue', 'today', 'week', 'nodate'):
@@ -1259,7 +1449,11 @@ class Store:
                     'search': 'fts5' if self.fts else 'like'}
 
     def _count_extra(self, counts, t, now):
-        pass
+        if in_do(t['matrix']):
+            counts['do'] += 1
+        for s in t['subtasks']:
+            if not s['done'] and in_do(s['matrix']):
+                counts['do'] += 1
 
     # -- reminders ---------------------------------------------------------
 
@@ -1304,6 +1498,7 @@ class Store:
                                        'created_at', 'updated_at', 'due_at', 'completed_at',
                                        'reminded_at')}
                 t['labels'] = [l['name'] for l in names.get(r['id'], [])]
+                t['matrix'] = [r['mx'], r['my']] if r['mx'] is not None and r['my'] is not None else None
                 tasks.append(t)
             data = {'app': 'TodoTracker', 'format': 1, 'exported_at': now_iso(),
                     'labels': labels, 'tasks': tasks}
@@ -1314,15 +1509,15 @@ class Store:
         children = self._task_children(c, [t['id'] for t in data['tasks']])
         for t in data['tasks']:
             t['subtasks'] = [self._subtask_export(r) for r in children.get(t['id'], ())]
+        data['dependencies'] = [{k: d[k] for k in ('id', 'before', 'after', 'created_at')} for d in self._deps(c)]
 
     def _subtask_export(self, r):
         return {k: r[k] for k in ('id', 'title', 'position', 'created_at', 'completed_at', 'due_at',
                                   'reminded_at', 'notes')} | {
-            'done': bool(r['done']), 'labels': [l['name'] for l in r['labels']]}
+            'done': bool(r['done']), 'labels': [l['name'] for l in r['labels']],
+            'matrix': [r['mx'], r['my']] if r['mx'] is not None and r['my'] is not None else None}
 
     def counts(self):
         with self.read() as c:
-            return {
-                'tasks': c.execute('SELECT count(*) FROM tasks').fetchone()[0],
-                'labels': c.execute('SELECT count(*) FROM labels').fetchone()[0],
-            }
+            return {table: c.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
+                    for table in ('tasks', 'labels', 'subtasks', 'dependencies')}

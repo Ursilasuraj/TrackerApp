@@ -23,7 +23,7 @@ import db as dbmod
 APP_NAME = 'TodoTracker'
 # Bump when the API or the schema changes. The page compares it with the
 # version it was written for (CLIENT_API in web/app.js).
-API = 3
+API = 4
 
 MAX_JSON = 4 * 1024 * 1024
 MAX_IMAGE = 25 * 1024 * 1024
@@ -180,6 +180,10 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'/api/tasks', 'api_list_tasks'),
         ('GET', r'/api/tasks/(\d+)', 'api_get_task'),
         ('GET', r'/api/export', 'api_export'),
+        ('GET', r'/api/deps', 'api_list_deps'),
+        ('POST', r'/api/deps', 'api_add_dep'),
+        ('DELETE', r'/api/deps/(\d+)', 'api_delete_dep'),
+        ('POST', r'/api/matrix', 'api_matrix'),
         ('POST', r'/api/tasks', 'api_create_task'),
         ('POST', r'/api/tasks/(\d+)/subtasks', 'api_add_subtasks'),
         ('POST', r'/api/tasks/(\d+)/subtasks/order', 'api_order_subtasks'),
@@ -468,6 +472,24 @@ class Handler(BaseHTTPRequestHandler):
     def api_delete_subtask(self, sub_id, query):
         self._json_body()
         self._send_json(200, self.app.store.delete_subtask(sub_id))
+
+    # -- API: matrix and dependencies ------------------------------------
+
+    def api_matrix(self, query):
+        body = check_fields(self._json_body(), {'items': list}, required=('items',))
+        self._send_json(200, {'tasks': self.app.store.set_matrix(body['items'])})
+
+    def api_list_deps(self, query):
+        self._send_json(200, {'deps': self.app.store.list_deps()})
+
+    def api_add_dep(self, query):
+        body = check_fields(self._json_body(), {'before': str, 'after': str}, required=('before', 'after'))
+        dep_id, created, deps = self.app.store.add_dep(body['before'], body['after'])
+        self._send_json(201 if created else 200, {'id': dep_id, 'created': created, 'deps': deps})
+
+    def api_delete_dep(self, dep_id, query):
+        self._json_body()
+        self._send_json(200, {'deps': self.app.store.delete_dep(dep_id)})
 
     # -- API: labels -------------------------------------------------------
 

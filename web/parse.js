@@ -256,7 +256,67 @@
     return 'later';
   }
 
+  // ---- Eisenhower matrix rules -------------------------------------------
+
+  /** 'do' | 'schedule' | 'delegate' | 'eliminate' for [urgency, importance]. */
+  function quadrantOf(pos) {
+    if (!pos) return null;
+    return pos[1] >= 0.5 ? (pos[0] >= 0.5 ? 'do' : 'schedule') : (pos[0] >= 0.5 ? 'delegate' : 'eliminate');
+  }
+
+  /** A small deterministic offset (-1..1, -1..1) from an item key. */
+  function spread(key) {
+    let h = 2166136261;
+    for (const ch of String(key)) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); }
+    const a = ((h >>> 0) % 1000) / 999;
+    const b = ((Math.imul(h ^ (h >>> 15), 2246822507) >>> 0) % 1000) / 999;
+    return [a * 2 - 1, b * 2 - 1];
+  }
+
+  /** Where an item should go: due within 2 days (or overdue) is urgent; Low
+   *  priority is not important. Earlier dates sit further right, higher
+   *  priority further up, plus a small deterministic spread.
+   *  item: {key, due (own date, or the task's for a subtask), priority}. */
+  function suggestPlacement(item, now) {
+    now = now || new Date();
+    const due = item.due ? parseYMD(item.due) : null;
+    const days = due ? dayDiff(now, due) : null;
+    const urgent = days !== null && days <= 2;
+    const important = item.priority !== 'low';
+    let x;
+    if (urgent) x = 0.85 - 0.1 * Math.max(-1, Math.min(days, 2));
+    else if (days !== null) x = 0.42 - 0.32 * Math.min(days - 3, 30) / 30;
+    else x = 0.1;
+    let y = important ? (item.priority === 'high' ? 0.85 : 0.66) : 0.26;
+    const [dx, dy] = spread(item.key);
+    x += dx * 0.035;
+    y += dy * 0.035;
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    x = urgent ? clamp(x, 0.54, 0.96) : clamp(x, 0.04, 0.46);
+    y = important ? clamp(y, 0.54, 0.96) : clamp(y, 0.04, 0.46);
+    const quad = important ? (urgent ? 'do' : 'schedule') : (urgent ? 'delegate' : 'eliminate');
+    return { quad, pos: [Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000] };
+  }
+
+  /** Priority that follows a manual move of a task note (null: unchanged).
+   *  Crossing into the top half sets High, into the bottom half Low; moving
+   *  within a half never changes it. From the tray, only a contradiction is
+   *  fixed (Low in the top half -> High; High/Medium in the bottom -> Low). */
+  function priorityForMove(kind, priority, from, to) {
+    if (kind !== 'task' || !to) return null;
+    const toTop = to[1] >= 0.5;
+    let want;
+    if (from) {
+      if ((from[1] >= 0.5) === toTop) return null;
+      want = toTop ? 'high' : 'low';
+    } else if (toTop && priority === 'low') want = 'high';
+    else if (!toTop && priority !== 'low') want = 'low';
+    else return null;
+    return want === priority ? null : want;
+  }
+
   return {
+    quadrantOf, spread, suggestPlacement, priorityForMove,
     parseDue, parseTime, parseQuickAdd, parseSubtaskTitle, labelFromToken, labelQueryAt,
     suggestLabels, splitPastedLines, isOverdue, dueState, dueLabel, dueLong, stampLabel,
     dueGroup, dayDiff, parseYMD, ymd, addDays, startOfDay, pad, MONTHS, WEEKDAY_NAMES,

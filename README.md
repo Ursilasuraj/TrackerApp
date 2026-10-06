@@ -137,6 +137,40 @@ Any task can have subtasks (details panel → *Add a subtask*):
   and then removes exactly those lines; the rest of the description is left
   untouched.
 
+### Eisenhower matrix
+
+Open it with *Eisenhower matrix* at the top of the sidebar (the number is the
+open items in Do).
+
+- **Board:** Schedule (top left: important, not urgent), Do (top right),
+  Eliminate (bottom left), Delegate (bottom right); urgency grows to the
+  right, importance upwards. Tasks and subtasks are both notes, placed freely
+  (a subtask can sit in another quadrant than its task).
+- **Unsorted tray** (right): open tasks and subtasks not on the board,
+  grouped by task. Drag an item onto the board, or click its suggestion chip
+  ("→ Do"), or press Enter on it; *Place all by suggestion* places everything.
+  Drag a note onto the tray to take it off the board. Suggestion: due within
+  2 days (or overdue) is urgent; Low priority is not important; a subtask
+  uses its own date or else its task's.
+- **Priority follows placement** for manual moves of task notes: crossing
+  into the top half sets High, into the bottom half Low (with a short
+  notice). Moving within a half or accepting suggestions never changes it.
+- **Links ("A before B"):** drag a note's ⇢ handle onto the note that must
+  wait for it. Arrows turn dashed once the first is done; a note shows
+  "⛓ waits for N". Clicking a note highlights its whole chain; clicking an
+  arrow selects it (*Remove link* or Delete). Self-links and loops are
+  refused with a message.
+- **Today strip** (above the board): the open items in Do, overdue first.
+  **Warnings**: due by today but in Schedule/Eliminate, more than 8 in Do,
+  unsorted items due within 2 days, Do items waiting for something not in
+  Do. Click a warning to highlight its items.
+- **Filters:** Tasks / Subtasks / Show done, plus the sidebar's label filter
+  (a subtask without labels counts with its task's labels) and the search.
+- **Keys:** notes are focusable; arrows move a note by 2 % (Shift: 10 %),
+  Enter opens it, Space shows its chain, Delete puts it back in the tray, Esc
+  clears the highlight. Double-click opens a note (a subtask opens its task
+  at that subtask). The details panel floats over the board here.
+
 ### Reminders
 
 When a target time arrives a Windows notification appears (date-only targets
@@ -174,6 +208,14 @@ the label list, dependencies). Images are not in the export: copy
 - **Typing a date with the keyboard**: while the year is being typed the
   browser reports years like 0002 or 0203; those are ignored until the year
   has four digits, then the date is saved at once.
+- **Dragging a task from the tray** only fixes a contradiction (a Low task
+  dropped in the top half becomes High, a High/Medium task dropped in the
+  bottom half becomes Low); a Medium task dropped in the top half stays
+  Medium. Crossing the middle line with a note already on the board sets
+  High or Low as specified.
+- **Double-click on a note** is detected from the click's count rather than
+  the `dblclick` event: the first click redraws the board (to show the
+  chain), and Chromium then sends no `dblclick`.
 - **Folded tasks while filtering by labels** show the subtasks that carry
   the label themselves (a subtask without labels does not count there; on
   the matrix it counts with its task's labels, as specified).
@@ -262,6 +304,10 @@ POST   /api/tasks/{id}/subtasks        {title} or {items: [title | {title, done?
 POST   /api/tasks/{id}/subtasks/order  {ids: [...]}
 PATCH  /api/subtasks/{id}              {title?, done?, due_at?, labels?, notes?}
 DELETE /api/subtasks/{id}              (every subtask write answers with the whole parent task)
+POST   /api/matrix                     {items: [{key: "t12" | "s34", matrix: [urgency, importance] | null, priority?}]}
+GET    /api/deps
+POST   /api/deps                       {before: "t12", after: "s34"}   (loops and self-links: 400; duplicates: no-op)
+DELETE /api/deps/{id}
 PATCH  /api/labels/{id}            {name?, color?}   (renaming onto an existing name merges)
 DELETE /api/labels/{id}
 POST   /api/images                 raw image body (PNG, JPEG, GIF, WebP, BMP; ≤ 25 MB)
