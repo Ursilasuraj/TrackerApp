@@ -1,0 +1,5 @@
+# Personal data never goes into git.
+data/
+__pycache__/
+*.pyc
+*.log
