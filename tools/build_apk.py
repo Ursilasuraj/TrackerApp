@@ -45,23 +45,33 @@ def run(cmd, **kw):
     subprocess.run([str(c) for c in cmd], check=True, **kw)
 
 
-def version_key(name):
-    return [int(x) if x.isdigit() else x for x in re.split(r'[.-]', name)]
+def by_version(paths, name_of):
+    """Paths with a plain version number ("35.0.0", "android-34"), newest
+    first; previews ("36.0.0-rc1", "android-35-ext14", "android-Baklava")
+    are left out."""
+    found = []
+    for p in paths:
+        m = re.fullmatch(r'(?:android-)?(\d+(?:\.\d+)*)', name_of(p))
+        if m:
+            found.append((tuple(int(x) for x in m.group(1).split('.')), p))
+    return [p for _, p in sorted(found, reverse=True)]
 
 
 def find_tools(sdk):
     tools = {}
     if sdk:
-        bt = sorted(glob.glob(os.path.join(sdk, 'build-tools', '*')), key=lambda p: version_key(os.path.basename(p)))
-        if bt:
+        # Each tool from the newest build-tools that has it (newer ones may
+        # no longer ship aapt).
+        for bt in by_version(glob.glob(os.path.join(sdk, 'build-tools', '*')), os.path.basename):
             for name in ('aapt', 'zipalign', 'apksigner', 'd8'):
-                path = os.path.join(bt[-1], name)
-                if os.path.exists(path):
-                    tools[name] = path
-        jars = sorted(glob.glob(os.path.join(sdk, 'platforms', 'android-*', 'android.jar')),
-                      key=lambda p: version_key(os.path.basename(os.path.dirname(p)).split('-', 1)[1]))
+                for file in (name, name + '.exe', name + '.bat'):     # Windows: aapt.exe, d8.bat
+                    path = os.path.join(bt, file)
+                    if name not in tools and os.path.exists(path):
+                        tools[name] = path
+        jars = by_version(glob.glob(os.path.join(sdk, 'platforms', 'android-*', 'android.jar')),
+                          lambda p: os.path.basename(os.path.dirname(p)))
         if jars:
-            tools['android.jar'] = jars[-1]
+            tools['android.jar'] = jars[0]
     for name in ('aapt', 'zipalign', 'apksigner', 'd8'):
         tools.setdefault(name, shutil.which(name))
     if not tools.get('d8'):

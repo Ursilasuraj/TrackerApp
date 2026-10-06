@@ -57,15 +57,19 @@ class JavaLogicTests(unittest.TestCase):
 
 
 def find_build_tools():
+    import build_apk
     try:
-        import build_apk
         return build_apk.find_tools(os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT'))
-    except SystemExit:
+    except SystemExit:          # something missing: skip (anything else is a bug and fails here)
         return None
 
 
-@unittest.skipUnless(find_build_tools() and shutil.which('keytool'), 'needs the Android build tools')
 class ApkBuildTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not (find_build_tools() and shutil.which('keytool')):
+            raise unittest.SkipTest('needs the Android build tools')
+
     def test_build(self):
         import build_apk
         tmp = tempfile.mkdtemp(prefix='tt-apk-test-')
