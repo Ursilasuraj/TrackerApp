@@ -16,8 +16,8 @@
   const MD = window.TTMarkdown;
   const ROOT = document.documentElement;
   const BOOT = { api: Number(ROOT.dataset.api) || 0, build: ROOT.dataset.build || '' };
-  const CLIENT_API = 2;            // the server API this page is written for
-  const FEATURE_API = { subtasks: 2 };   // feature -> minimum server API
+  const CLIENT_API = 3;            // the server API this page is written for
+  const FEATURE_API = { subtasks: 2, subtaskDetails: 3 };   // feature -> minimum server API
   const KEEPALIVE_BUDGET = 60000;  // Chromium allows 64 KB of keepalive bodies in flight
   const STATUS_NAMES = { open: 'Open', in_progress: 'In progress', done: 'Done' };
   const PRIORITY_NAMES = { high: 'High', medium: 'Medium', low: 'Low' };
@@ -149,9 +149,16 @@
   // ------------------------------------------- focus-keeping redraws
 
   const TEXT_INPUT = /^(text|search|url|email|tel|number|password)$/;
+  const KEPT_INPUT = /^(text|search|url|email|tel|number|password|date|time)$/;
 
   function isTextField(el) {
     return !!el && (el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && TEXT_INPUT.test(el.type)));
+  }
+
+  // Fields kept as the same node across redraws while focused (text keeps
+  // its undo history; a date field keeps the segment being typed).
+  function isKeptField(el) {
+    return !!el && (el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && KEPT_INPUT.test(el.type)));
   }
 
   function snapshotFocus(container) {
@@ -242,7 +249,7 @@
     const top = scroller ? scroller.scrollTop : 0;
     const snap = snapshotFocus(container);
     let kept = false;
-    if (snap && snap.k && isTextField(snap.el)) kept = rebuildAround(container, html, snap.el);
+    if (snap && snap.k && isKeptField(snap.el)) kept = rebuildAround(container, html, snap.el);
     if (!kept) {
       container.innerHTML = html;
       if (snap) restoreFocus(container, snap, opts.fallback);
@@ -1117,11 +1124,16 @@
 
   async function openEditor(id, initial, opts) {
     opts = opts || {};
-    const startFocus = document.activeElement;
+    const focusKey = () => {
+      const a = document.activeElement;
+      return a && a !== document.body ? (a.dataset && a.dataset.k) || a.id || a.tagName : null;
+    };
+    const startFocus = focusKey();
     if (S.openId !== id) {
       flushFields();
       if (TT.beforeEditorSwitch) TT.beforeEditorSwitch();
     }
+    if (opts.details != null && S.subDetails) S.subDetails.add(opts.details);
     S.openId = id;
     E.saveError = false;
     if (initial && initial.description !== undefined) E.task = initial;
@@ -1143,8 +1155,8 @@
     // Move focus into the editor unless the user has moved on meanwhile.
     if (opts.focus !== 'none') {
       const target = $(kq(opts.focusK || 'ed:title'));
-      const now = document.activeElement;
-      if (target && (now === startFocus || now === document.body || !now)) target.focus({ preventScroll: true });
+      const now = focusKey();
+      if (target && (now === startFocus || now === null)) target.focus({ preventScroll: true });
     }
     if (TT.afterEditorOpen) TT.afterEditorOpen(opts);
   }
@@ -1313,6 +1325,11 @@
     E.labelSug.arrowUsed = false;
   }
 
+  /** A year typed digit by digit passes through 0002, 0020, 0203: not a real date yet. */
+  function incompleteDate(date) {
+    return !!date && Number(date.slice(0, 4)) < 1000;
+  }
+
   function dueFromInputs() {
     const date = $(kq('ed:date')).value;
     let time = $(kq('ed:time')).value;
@@ -1433,7 +1450,9 @@
       if (!E.task) return;
       if (k === 'ed:status') queueField(E.task.id, 'status', el.value, 0);
       else if (k === 'ed:priority') queueField(E.task.id, 'priority', el.value, 0);
-      else if (k === 'ed:date' || k === 'ed:time') queueField(E.task.id, 'due_at', dueFromInputs(), 0);
+      else if (k === 'ed:date' || k === 'ed:time') {
+        if (!incompleteDate($(kq('ed:date')).value)) queueField(E.task.id, 'due_at', dueFromInputs(), 0);
+      }
       else if (TT.editorChange) TT.editorChange(e);
     });
     panel.addEventListener('keydown', (e) => {
@@ -1777,7 +1796,7 @@
     if (TT.matrix) TT.matrix.render();
   }
 
-  function subtaskBusy() { return Q.pending > 0; }
+  function subtaskBusy() { return Q.pending > 0 || N.pending.size > 0; }
 
   function enqueue(taskId, build, opts) {
     opts = opts || {};
@@ -1834,6 +1853,8 @@
         for (const s of t.subtasks || []) if (s.id === temp) s.id = real;
       }
       if (Q.drafts.has(temp)) { Q.drafts.set(real, Q.drafts.get(temp)); Q.drafts.delete(temp); }
+      if (S.subDetails.has(temp)) { S.subDetails.delete(temp); S.subDetails.add(real); }
+      if (N.pending.has(temp)) { N.pending.set(real, N.pending.get(temp)); N.pending.delete(temp); }
       // Rename the live elements, so focus and typed text follow the subtask.
       for (const el of $$('[data-k^="s' + temp + ':"], [data-k^="ls' + temp + ':"]')) {
         el.dataset.k = el.dataset.k.replace(/^(l?s)-\d+:/, '$1' + real + ':');
@@ -1857,7 +1878,8 @@
     const stamp = nowStamp();
     mutate(taskId, (t) => {
       items.forEach((it, i) => {
-        const sub = Object.assign({ task_id: taskId, done: false, created_at: stamp, completed_at: null }, it, { id: temps[i] });
+        const sub = Object.assign({ task_id: taskId, done: false, created_at: stamp, completed_at: null, labels: [], notes: '' },
+          localSubtaskFields(taskId, it), { id: temps[i] });
         if (sub.done && !sub.completed_at) sub.completed_at = stamp;
         if (it.position != null && it.position < t.subtasks.length) t.subtasks.splice(it.position, 0, sub);
         else t.subtasks.push(sub);
@@ -1882,7 +1904,7 @@
       const s = t.subtasks.find((x) => x.id === sid);
       if (!s) return;
       if ('done' in fields && fields.done !== s.done) s.completed_at = fields.done ? stamp : null;
-      Object.assign(s, TT.localSubtaskFields ? TT.localSubtaskFields(fields) : fields);
+      Object.assign(s, localSubtaskFields(taskId, fields));
     });
     renderSubtaskViews(taskId);
     return enqueue(taskId, () => {
@@ -1969,16 +1991,19 @@
 
   // -- subtasks in the list
 
-  function rowExtraBadges(t) {
+  function rowExtraBadges(t, now) {
     const [done, total] = t.progress || [0, 0];
     if (!total || !supports('subtasks')) return '';
+    let early = '';
+    const sub = supports('subtaskDetails') ? earlierSubtaskDue(t) : null;
+    if (sub) early = dueBadgeHTML(sub, now, '↳ ⏱').replace('title="Target: ', 'title="A subtask is due ');
     const open = S.unfolded.has(t.id);
     const pct = Math.round((done / total) * 100);
     return '<button type="button" class="badge sub-badge" data-act="unfold" data-k="t' + t.id + ':unfold" aria-expanded="' + open + '"'
       + ' aria-label="Subtasks ' + done + ' of ' + total + ' done; ' + (open ? 'hide' : 'show') + ' them"'
       + ' title="' + (open ? 'Hide' : 'Show') + ' subtasks">'
       + '<span class="mini-bar" aria-hidden="true"><span style="width:' + pct + '%"></span></span>'
-      + done + '/' + total + '<span aria-hidden="true">' + (open ? '▲' : '▼') + '</span></button>';
+      + done + '/' + total + '<span aria-hidden="true">' + (open ? '▲' : '▼') + '</span></button>' + early;
   }
 
   function miniSubHTML(t, s, now) {
@@ -2400,7 +2425,253 @@
     if (TT.flushSubtaskExtra) TT.flushSubtaskExtra();
   }
 
-  function beforeEditorSwitch() { flushSubtasks(); }
+  function beforeEditorSwitch() {
+    flushSubtasks();
+    S.subDetails.clear();
+  }
+
+  // ------------------------------------------------- subtask details
+
+  // Each subtask can have a target date (with optional time), a subset of
+  // its task's labels and free-text notes. Notes autosave after a 700 ms
+  // pause, when the box is left, on Esc, when the editor switches or closes
+  // and when the window closes.
+  const NOTES_DELAY = 700;
+  const N = { pending: new Map() };   // subtask id -> {taskId, value, timer}
+  S.subDetails = new Set();
+
+  function firstLine(text) {
+    for (const line of String(text || '').split('\n')) {
+      const s = line.trim();
+      if (s) return s.length > 120 ? s.slice(0, 119) + '…' : s;
+    }
+    return '';
+  }
+
+  function localSubtaskFields(taskId, fields) {
+    const out = Object.assign({}, fields);
+    if (fields.labels) {
+      const t = currentTask(taskId);
+      const byName = new Map(((t && t.labels) || []).map((l) => [l.name.toLowerCase(), l]));
+      out.labels = fields.labels.map((n) => (typeof n === 'string' ? byName.get(n.toLowerCase()) : n)).filter(Boolean);
+    }
+    if ('notes' in fields) {
+      out.note1 = firstLine(fields.notes);
+      out.has_notes = !!String(fields.notes || '').trim();
+    }
+    return out;
+  }
+
+  function subtaskItemExtra(it, out) {
+    if (it.due_at) out.due_at = it.due_at;
+    if (it.labels && it.labels.length) out.labels = it.labels.map((l) => (typeof l === 'string' ? l : l.name));
+    if (it.notes) out.notes = it.notes;
+  }
+
+  function parseSubtaskInput(text, task) {
+    return P.parseSubtaskTitle(text, ((task && task.labels) || []).map((l) => l.name), new Date());
+  }
+
+  function subtaskTokenFields(parsed, s) {
+    const fields = {};
+    if (!supports('subtaskDetails')) return fields;
+    if (parsed.labels && parsed.labels.length) {
+      const names = ((s && s.labels) || []).map((l) => l.name);
+      for (const n of parsed.labels) if (!names.some((x) => x.toLowerCase() === n.toLowerCase())) names.push(n);
+      fields.labels = names;
+    }
+    if (parsed.due) fields.due_at = parsed.due;
+    return fields;
+  }
+
+  function subMetaHTML(t, s, now, where) {
+    if (!supports('subtaskDetails')) return '';
+    const parts = [];
+    const act = where === 'list' ? 'mini-meta' : 'sub-meta';
+    const k = (where === 'list' ? 'ls' : 's') + s.id;
+    if (s.due_at) {
+      const st = s.done ? 'future' : P.dueState(s.due_at, now);
+      parts.push('<button type="button" class="badge due ' + st + '" data-act="' + act + '" data-part="date" data-sid="' + s.id + '" data-k="' + k + ':meta-date"'
+        + ' title="Target ' + esc(P.dueLong(s.due_at)) + (st === 'overdue' ? ' (overdue)' : '') + '">⏱ ' + esc(P.dueLabel(s.due_at, now)) + '</button>');
+    }
+    if (s.labels && s.labels.length) {
+      parts.push('<button type="button" class="meta-labels" data-act="' + act + '" data-part="labels" data-sid="' + s.id + '" data-k="' + k + ':meta-labels"'
+        + ' aria-label="Labels: ' + esc(s.labels.map((l) => l.name).join(', ')) + '">'
+        + s.labels.map((l) => chipHTML(l)).join('') + '</button>');
+    }
+    const note = s.note1 !== undefined ? s.note1 : firstLine(s.notes);
+    if (note) {
+      parts.push('<button type="button" class="note1" data-act="' + act + '" data-part="notes" data-sid="' + s.id + '" data-k="' + k + ':meta-notes"'
+        + ' title="Notes">📝 ' + esc(note) + '</button>');
+    }
+    return parts.length ? '<div class="sub-meta">' + parts.join('') + '</div>' : '';
+  }
+
+  function subButtonsHTML(t, s) {
+    if (!supports('subtaskDetails')) return '';
+    const open = S.subDetails.has(s.id);
+    return '<button type="button" class="icon-btn sub-more" data-act="sub-more" data-k="s' + s.id + ':more" aria-expanded="' + open + '"'
+      + ' aria-label="Details of ' + esc(s.title) + ' (Alt+Enter)" title="Date, labels, notes (Alt+Enter)">⋯</button>';
+  }
+
+  function subDetailsHTML(t, s) {
+    if (!supports('subtaskDetails') || !S.subDetails.has(s.id)) return '';
+    const k = 's' + s.id;
+    const due = s.due_at || '';
+    const notes = s.notes !== undefined ? s.notes : '';
+    const pending = N.pending.get(s.id);
+    const labels = (t.labels || []).length
+      ? t.labels.map((l) => {
+        const on = (s.labels || []).some((x) => x.id === l.id || x.name.toLowerCase() === l.name.toLowerCase());
+        return '<button type="button" class="chip toggle' + (on ? ' on' : '') + '" style="--lc:' + esc(l.color) + '" data-act="sub-label"'
+          + ' data-name="' + esc(l.name) + '" data-k="' + k + ':lbl:' + esc(l.name.toLowerCase()) + '" aria-pressed="' + on + '">'
+          + '<span class="chip-dot" aria-hidden="true"></span><span class="chip-text">' + esc(l.name) + '</span></button>';
+      }).join('')
+      : '<span class="hint">The task has no labels yet; a subtask can only use its task’s labels.</span>';
+    return '<div class="sub-details" role="group" aria-label="Details of ' + esc(s.title) + '">'
+      + '<div class="sd-row"><label class="ed-label" for="sd-date-' + s.id + '">Target</label>'
+      + '<input type="date" id="sd-date-' + s.id + '" data-k="' + k + ':date" value="' + esc(due.slice(0, 10)) + '">'
+      + '<input type="time" data-k="' + k + ':time" value="' + esc(due.length > 10 ? due.slice(11, 16) : '') + '" aria-label="Target time (optional)">'
+      + (due ? '<button type="button" class="icon-btn" data-act="sub-nodate" data-k="' + k + ':nodate" aria-label="No target date" title="No target date">✕</button>' : '')
+      + '</div>'
+      + '<div class="sd-row"><span class="ed-label" id="sd-lbl-' + s.id + '">Labels</span>'
+      + '<div class="sd-labels" role="group" aria-labelledby="sd-lbl-' + s.id + '">' + labels + '</div></div>'
+      + '<label class="ed-label" for="sd-notes-' + s.id + '">Notes</label>'
+      + '<textarea id="sd-notes-' + s.id + '" class="sd-notes" data-k="' + k + ':notes" rows="4" maxlength="20000" spellcheck="true">\n'
+      + esc(pending ? pending.value : notes) + '</textarea>'
+      + '</div>';
+  }
+
+  function openSubtaskDetails(sid, part) {
+    if (!E.task || !supports('subtaskDetails')) return;
+    S.subDetails.add(sid);
+    renderEditor();
+    const k = 's' + sid + ':' + (part === 'labels' ? 'lbl:' : part === 'notes' ? 'notes' : 'date');
+    const target = part === 'labels' ? $('#editor [data-k^="' + k + '"]') || $(kq('s' + sid + ':date')) : $(kq(k));
+    if (target) {
+      target.focus({ preventScroll: false });
+      target.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function closeSubtaskDetails(sid) {
+    flushNotes(sid);
+    S.subDetails.delete(sid);
+    renderEditor();
+    const title = $(kq('s' + sid + ':title'));
+    if (title) title.focus({ preventScroll: true });
+  }
+
+  function subDueFromInputs(sid) {
+    const date = $(kq('s' + sid + ':date')).value;
+    const time = $(kq('s' + sid + ':time')).value;
+    if (!date && !time) return null;
+    const d = date || P.ymd(new Date());
+    return time ? d + 'T' + time.slice(0, 5) : d;
+  }
+
+  function queueNotes(taskId, sid, value) {
+    const prev = N.pending.get(sid);
+    if (prev) clearTimeout(prev.timer);
+    N.pending.set(sid, { taskId, value, timer: setTimeout(() => flushNotes(sid), NOTES_DELAY) });
+    updateSaveState();
+  }
+
+  function flushNotes(sid) {
+    const p = N.pending.get(sid);
+    if (!p) return;
+    clearTimeout(p.timer);
+    N.pending.delete(sid);
+    const s = findSub(p.taskId, sid);
+    const value = p.value.replace(/\s+$/, '');
+    if (s && value !== (s.notes || '')) updateSubtask(p.taskId, sid, { notes: value });
+    else updateSaveState();
+  }
+
+  function flushAllNotes() {
+    for (const sid of Array.from(N.pending.keys())) flushNotes(sid);
+  }
+
+  function subtaskActionExtra(act, el, sid) {
+    if (!E.task) return;
+    if (act === 'sub-more') {
+      if (S.subDetails.has(sid)) closeSubtaskDetails(sid);
+      else openSubtaskDetails(sid, 'date');
+    } else if (act === 'sub-meta') openSubtaskDetails(Number(el.dataset.sid), el.dataset.part);
+    else if (act === 'sub-nodate') {
+      updateSubtask(E.task.id, sid, { due_at: null });
+      const d = $(kq('s' + sid + ':date'));
+      if (d) d.focus({ preventScroll: true });
+    } else if (act === 'sub-label') {
+      const s = findSub(E.task.id, sid);
+      if (!s) return;
+      const name = el.dataset.name;
+      const names = (s.labels || []).map((l) => l.name);
+      const has = names.some((n) => n.toLowerCase() === name.toLowerCase());
+      updateSubtask(E.task.id, sid, { labels: has ? names.filter((n) => n.toLowerCase() !== name.toLowerCase()) : names.concat([name]) });
+    }
+  }
+
+  function subtaskChangeExtra(e) {
+    const k = e.target.dataset.k || '';
+    const m = /^s(-?\d+):(date|time)$/.exec(k);
+    if (m && E.task && !incompleteDate($(kq('s' + m[1] + ':date')).value)) {
+      updateSubtask(E.task.id, Number(m[1]), { due_at: subDueFromInputs(Number(m[1])) });
+    }
+  }
+
+  function subtaskInputExtra(e) {
+    const m = /^s(-?\d+):notes$/.exec(e.target.dataset.k || '');
+    if (m && E.task) queueNotes(E.task.id, Number(m[1]), e.target.value);
+  }
+
+  function subtaskFocusoutExtra(e) {
+    const m = /^s(-?\d+):notes$/.exec(e.target.dataset.k || '');
+    if (m) flushNotes(Number(m[1]));
+  }
+
+  function subtaskKeydownExtra(e, sid) {
+    const k = e.target.dataset.k || '';
+    if (e.key === 'Escape' && /^s-?\d+:(notes|date|time|nodate|lbl:.*)$/.test(k)) {
+      // Esc saves the notes and closes the details, back to the title.
+      e.preventDefault();
+      e.stopPropagation();
+      closeSubtaskDetails(sid);
+    } else if (e.key === 'Enter' && /:lbl:/.test(k)) {
+      // Buttons toggle natively on Enter; nothing else to do.
+    }
+  }
+
+  function listActionExtra(act, el, id) {
+    if (act !== 'mini-meta') return;
+    const sid = Number(el.dataset.sid);
+    const part = el.dataset.part;
+    openEditor(id, null, { details: sid, focusK: 's' + sid + ':' + (part === 'notes' ? 'notes' : 'date') });
+  }
+
+  function pendingNotesRequests() {
+    const reqs = [];
+    for (const [sid, p] of N.pending) {
+      const id = realId(sid);
+      if (id) reqs.push({ method: 'PATCH', url: '/api/subtasks/' + id, body: { notes: p.value.replace(/\s+$/, '') } });
+    }
+    return reqs;
+  }
+
+  function clearNotes() {
+    for (const p of N.pending.values()) clearTimeout(p.timer);
+    N.pending.clear();
+  }
+
+  /** Earliest open subtask date, when it comes before the task's own. */
+  function earlierSubtaskDue(t) {
+    if (t.status === 'done') return null;
+    let best = null;
+    for (const s of t.subtasks || []) {
+      if (!s.done && s.due_at && (!best || s.due_at < best)) best = s.due_at;
+    }
+    return best && (!t.due_at || best < t.due_at) ? best : null;
+  }
 
   // ------------------------------------------------------------- boot
 
@@ -2418,6 +2689,12 @@
     editorAction, editorChange, editorInput, editorFocusout, convertChecklist, beforeEditorSwitch,
     mergeLocal: mergeLocalSubtasks, mergeEditorLocal, pendingSubtaskRequests, clearPendingSubtasks,
     flushSubtasks, subtaskChain: () => Q.chain,
+    // subtask details
+    subtaskMetaHTML: subMetaHTML, subtaskButtonsHTML: subButtonsHTML, subtaskDetailsHTML: subDetailsHTML,
+    openSubtaskDetails, parseSubtaskInput, subtaskTokenFields, subtaskItemExtra, subtaskActionExtra,
+    subtaskChangeExtra, subtaskInputExtra, subtaskFocusoutExtra, subtaskKeydownExtra, listActionExtra,
+    pendingSubtaskExtra: pendingNotesRequests, clearSubtaskExtra: clearNotes, flushSubtaskExtra: flushAllNotes,
+    earlierSubtaskDue, firstLine,
     showPage(page) {
       S.page = page === 'matrix' && TT.matrix ? 'matrix' : 'list';
       $('#list-page').hidden = S.page !== 'list';

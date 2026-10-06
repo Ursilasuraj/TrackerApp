@@ -34,6 +34,7 @@ MAX_DESCRIPTION = 200_000
 MAX_LABEL = 40
 MAX_LABELS_PER_TASK = 50
 MAX_SUBTASKS_PER_REQUEST = 500
+MAX_NOTES = 20_000
 REMIND_DATE_ONLY_AT = '09:00'
 
 DATE_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})$')
@@ -102,22 +103,54 @@ TABLES = [
         done INTEGER NOT NULL DEFAULT 0,
         position INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
-        completed_at TEXT
+        completed_at TEXT,
+        due_at TEXT,
+        reminded_at TEXT,
+        notes TEXT NOT NULL DEFAULT ''
+    )'''),
+    ('subtask_labels', '''CREATE TABLE IF NOT EXISTS subtask_labels (
+        subtask_id INTEGER NOT NULL REFERENCES subtasks(id) ON DELETE CASCADE,
+        label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+        PRIMARY KEY (subtask_id, label_id)
     )'''),
 ]
 
 ADDED_COLUMNS = [
     # (table, column, definition)
     ('tasks', 'reminded_at', 'TEXT'),
+    ('subtasks', 'due_at', 'TEXT'),
+    ('subtasks', 'reminded_at', 'TEXT'),
+    ('subtasks', 'notes', "TEXT NOT NULL DEFAULT ''"),
 ]
 
 INDEXES = [
     ('idx_tasks_status', 'CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)'),
     ('idx_task_labels_label', 'CREATE INDEX IF NOT EXISTS idx_task_labels_label ON task_labels(label_id)'),
     ('idx_subtasks_task', 'CREATE INDEX IF NOT EXISTS idx_subtasks_task ON subtasks(task_id, position)'),
+    ('idx_subtask_labels_label', 'CREATE INDEX IF NOT EXISTS idx_subtask_labels_label ON subtask_labels(label_id)'),
 ]
 
-TRIGGERS = []
+# A subtask's labels are always a subset of its task's labels. The database
+# enforces it: inserting another label fails, and taking a label off a task
+# takes it off all of the task's subtasks.
+_SUBSET_CHECK = '''NOT EXISTS (SELECT 1 FROM subtasks s JOIN task_labels tl ON tl.task_id = s.task_id
+                   WHERE s.id = NEW.subtask_id AND tl.label_id = NEW.label_id)'''
+TRIGGERS = [
+    ('trg_subtask_labels_subset_insert',
+     f'''CREATE TRIGGER IF NOT EXISTS trg_subtask_labels_subset_insert BEFORE INSERT ON subtask_labels
+         WHEN {_SUBSET_CHECK}
+         BEGIN SELECT RAISE(ABORT, 'A subtask can only have labels of its task'); END'''),
+    ('trg_subtask_labels_subset_update',
+     f'''CREATE TRIGGER IF NOT EXISTS trg_subtask_labels_subset_update BEFORE UPDATE ON subtask_labels
+         WHEN {_SUBSET_CHECK}
+         BEGIN SELECT RAISE(ABORT, 'A subtask can only have labels of its task'); END'''),
+    ('trg_task_labels_cascade_subtasks',
+     '''CREATE TRIGGER IF NOT EXISTS trg_task_labels_cascade_subtasks AFTER DELETE ON task_labels
+        BEGIN
+          DELETE FROM subtask_labels WHERE label_id = OLD.label_id
+             AND subtask_id IN (SELECT id FROM subtasks WHERE task_id = OLD.task_id);
+        END'''),
+]
 
 FTS_COLUMNS = ['title', 'description', 'subtasks']
 FTS_CREATE = ("CREATE VIRTUAL TABLE tasks_fts USING fts5("
@@ -179,6 +212,23 @@ def clean_stamp(value, what='Timestamp'):
     except ValueError:
         raise ValidationError(f'{what} is not a valid date and time.')
     return value
+
+
+def clean_notes(value):
+    if not isinstance(value, str):
+        raise ValidationError('Notes must be text.')
+    value = value.replace('\r\n', '\n').replace('\r', '\n').rstrip()
+    if len(value) > MAX_NOTES:
+        raise ValidationError(f'Notes are too long (at most {MAX_NOTES} characters).')
+    return value
+
+
+def first_line(text, limit=120):
+    for line in (text or '').split('\n'):
+        line = line.strip()
+        if line:
+            return line if len(line) <= limit else line[:limit - 1].rstrip() + '…'
+    return ''
 
 
 def clean_status(value):
@@ -609,6 +659,53 @@ class Store:
                 c.execute('INSERT INTO task_labels(task_id, label_id) VALUES (?, ?)', (task_id, lid))
         return True
 
+    def _subtask_label_ids(self, c, task_id, names):
+        """Label ids for a subtask: only labels its task has. A subtask never
+        creates labels."""
+        if not isinstance(names, list):
+            raise ValidationError('Labels must be a list of names.')
+        task_labels = {r[1].lower(): r[0] for r in c.execute(
+            'SELECT l.id, l.name FROM task_labels tl JOIN labels l ON l.id = tl.label_id WHERE tl.task_id = ?',
+            (task_id,))}
+        ids = []
+        for name in names:
+            if not isinstance(name, str):
+                raise ValidationError('Labels must be a list of names.')
+            key = name.strip().lstrip('#').lower()
+            if key not in {k for k in task_labels}:
+                raise ValidationError(f'Label "{name.strip()[:40]}" is not on the task; a subtask can only use its task\'s labels.')
+            if task_labels[key] not in ids:
+                ids.append(task_labels[key])
+        return ids
+
+    def _set_subtask_labels(self, c, sub_id, task_id, names):
+        wanted = self._subtask_label_ids(c, task_id, names)
+        current = [r[0] for r in c.execute(
+            'SELECT label_id FROM subtask_labels WHERE subtask_id = ? ORDER BY rowid', (sub_id,))]
+        if current == wanted:
+            return False
+        c.execute('DELETE FROM subtask_labels WHERE subtask_id = ?', (sub_id,))
+        for lid in wanted:
+            c.execute('INSERT INTO subtask_labels(subtask_id, label_id) VALUES (?, ?)', (sub_id, lid))
+        return True
+
+    def _labels_by_subtask(self, c, sub_ids):
+        out = {}
+        if not sub_ids:
+            return out
+        if len(sub_ids) > 500:
+            rows = c.execute('SELECT sl.subtask_id, l.id, l.name, l.color FROM subtask_labels sl '
+                             'JOIN labels l ON l.id = sl.label_id ORDER BY sl.rowid').fetchall()
+            wanted = set(sub_ids)
+            rows = [r for r in rows if r[0] in wanted]
+        else:
+            rows = c.execute('SELECT sl.subtask_id, l.id, l.name, l.color FROM subtask_labels sl '
+                             f'JOIN labels l ON l.id = sl.label_id WHERE sl.subtask_id IN ({",".join("?" * len(sub_ids))}) '
+                             'ORDER BY sl.rowid', tuple(sub_ids)).fetchall()
+        for r in rows:
+            out.setdefault(r[0], []).append({'id': r[1], 'name': r[2], 'color': r[3]})
+        return out
+
     def _labels_by_task(self, c, task_ids=None):
         sql = ('SELECT tl.task_id, l.id, l.name, l.color FROM task_labels tl '
                'JOIN labels l ON l.id = tl.label_id')
@@ -665,7 +762,8 @@ class Store:
         return target_id
 
     def _merge_subtask_labels(self, c, source_id, target_id):
-        pass
+        c.execute('INSERT OR IGNORE INTO subtask_labels(subtask_id, label_id) '
+                  'SELECT subtask_id, ? FROM subtask_labels WHERE label_id = ?', (target_id, source_id))
 
     def delete_label(self, label_id):
         with self.write() as c:
@@ -788,10 +886,16 @@ class Store:
         self._clean_subtask_item_extra(item, out)
         return out
 
-    SUBTASK_ITEM_KEYS = ('title', 'done', 'position', 'created_at', 'completed_at')
+    SUBTASK_ITEM_KEYS = ('title', 'done', 'position', 'created_at', 'completed_at',
+                         'due_at', 'labels', 'notes')
 
     def _clean_subtask_item_extra(self, item, out):
-        pass
+        out['due_at'] = clean_due(item.get('due_at'))
+        out['notes'] = clean_notes(item.get('notes') or '')
+        labels = item.get('labels') or []
+        if not isinstance(labels, list):
+            raise ValidationError('Labels must be a list of names.')
+        out['labels'] = labels
 
     @staticmethod
     def _renumber(c, task_id):
@@ -839,7 +943,11 @@ class Store:
             return self._task(c, task_id), ids
 
     def _add_subtask_extra(self, c, task_id, sid, item, now):
-        pass
+        if item.get('due_at') or item.get('notes'):
+            c.execute('UPDATE subtasks SET due_at = ?, reminded_at = ?, notes = ? WHERE id = ?',
+                      (item.get('due_at'), rearm_value(item.get('due_at'), now), item.get('notes') or '', sid))
+        if item.get('labels'):
+            self._set_subtask_labels(c, sid, task_id, item['labels'])
 
     def _subtask_row(self, c, sub_id):
         row = c.execute('SELECT * FROM subtasks WHERE id = ?', (sub_id,)).fetchone()
@@ -874,7 +982,19 @@ class Store:
             return self._task(c, row['task_id'])
 
     def _update_subtask_extra(self, c, row, fields, sets, now):
-        return False
+        changed = False
+        if 'due_at' in fields:
+            due = clean_due(fields['due_at'])
+            if due != row['due_at']:
+                sets['due_at'] = due
+                sets['reminded_at'] = rearm_value(due, now)
+        if 'notes' in fields:
+            notes = clean_notes(fields['notes'])
+            if notes != row['notes']:
+                sets['notes'] = notes
+        if 'labels' in fields:
+            changed = self._set_subtask_labels(c, row['id'], row['task_id'], fields['labels'])
+        return changed
 
     def delete_subtask(self, sub_id):
         with self.write() as c:
@@ -929,14 +1049,17 @@ class Store:
         else:
             rows = c.execute(f'SELECT * FROM subtasks WHERE task_id IN ({",".join("?" * len(task_ids))}) '
                              'ORDER BY task_id, position, id', tuple(task_ids)).fetchall()
+        labels = self._labels_by_subtask(c, [r['id'] for r in rows])
         out = {}
         for r in rows:
-            out.setdefault(r['task_id'], []).append(r)
+            d = dict(r)
+            d['labels'] = labels.get(r['id'], [])
+            out.setdefault(r['task_id'], []).append(d)
         return out
 
     @staticmethod
     def _subtask_json(r, full=False):
-        return {
+        d = {
             'id': r['id'],
             'task_id': r['task_id'],
             'title': r['title'],
@@ -944,7 +1067,14 @@ class Store:
             'position': r['position'],
             'created_at': r['created_at'],
             'completed_at': r['completed_at'],
+            'due_at': r['due_at'],
+            'labels': r['labels'],
+            'note1': first_line(r['notes']),
+            'has_notes': bool(r['notes']),
         }
+        if full:
+            d['notes'] = r['notes']
+        return d
 
     def _task_json(self, row, labels, children, full=False, now=None):
         desc = row['description'] or ''
@@ -1032,7 +1162,8 @@ class Store:
     @staticmethod
     def _like_condition():
         return ("(t.title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\' OR EXISTS ("
-                "SELECT 1 FROM subtasks s WHERE s.task_id = t.id AND s.title LIKE ? ESCAPE '\\'))")
+                "SELECT 1 FROM subtasks s WHERE s.task_id = t.id AND (s.title LIKE ? ESCAPE '\\'"
+                " OR s.notes LIKE ? ESCAPE '\\')))")
 
     def list_tasks(self, view='open', label_ids=(), match='any', q='', sort='newest'):
         if view not in VIEWS:
@@ -1075,14 +1206,21 @@ class Store:
         return tasks
 
     def _mark_matches(self, t, rows, words, label_ids, match):
-        """Which subtasks match a search, for showing them under a folded task."""
-        if words:
-            t['match_subs'] = [r['id'] for r in rows
-                               if text_matches_any(words, r['title'] + ' ' + self._row_notes(r))]
-
-    @staticmethod
-    def _row_notes(r):
-        return r['notes'] if 'notes' in r.keys() else ''
+        """Which subtasks match the search and/or the label filter (by their
+        own labels), for showing them under a folded task."""
+        if not words and not label_ids:
+            return
+        wanted = set(label_ids or ())
+        hits = []
+        for r in rows:
+            if words and not text_matches_any(words, r['title'] + ' ' + (r['notes'] or '')):
+                continue
+            if wanted:
+                own = {l['id'] for l in r['labels']}
+                if not ((wanted <= own) if match == 'all' else (wanted & own)):
+                    continue
+            hits.append(r['id'])
+        t['match_subs'] = hits
 
     @staticmethod
     def _sort(tasks, sort, view):
@@ -1146,7 +1284,12 @@ class Store:
         return items
 
     def _due_subtask_reminders(self, c, current):
-        return []
+        moment = "CASE WHEN length(s.due_at) = 10 THEN s.due_at || 'T{}' ELSE s.due_at END".format(REMIND_DATE_ONLY_AT)
+        return [{'kind': 'subtask', 'id': r[0], 'title': r[1], 'due_at': r[2], 'task_id': r[3], 'task_title': r[4]}
+                for r in c.execute(
+                    f"SELECT s.id, s.title, s.due_at, t.id, t.title FROM subtasks s JOIN tasks t ON t.id = s.task_id "
+                    f"WHERE s.done = 0 AND t.status != 'done' AND s.due_at IS NOT NULL AND s.reminded_at IS NULL "
+                    f"AND {moment} <= ? ORDER BY {moment}, s.id", (current,))]
 
     # -- export ------------------------------------------------------------
 
@@ -1173,8 +1316,9 @@ class Store:
             t['subtasks'] = [self._subtask_export(r) for r in children.get(t['id'], ())]
 
     def _subtask_export(self, r):
-        return {k: r[k] for k in ('id', 'title', 'position', 'created_at', 'completed_at')} | {
-            'done': bool(r['done'])}
+        return {k: r[k] for k in ('id', 'title', 'position', 'created_at', 'completed_at', 'due_at',
+                                  'reminded_at', 'notes')} | {
+            'done': bool(r['done']), 'labels': [l['name'] for l in r['labels']]}
 
     def counts(self):
         with self.read() as c:

@@ -113,6 +113,25 @@ Any task can have subtasks (details panel → *Add a subtask*):
   click it to unfold the subtasks and tick them there (mouse, or Tab +
   Space/Enter). While searching, folded tasks show just the matching
   subtasks.
+- **Subtask details** (⋯ or **Alt+Enter** in its title): a target date with
+  an optional time, labels and notes.
+  - Labels: only a subset of the task's own labels (shown as toggle chips).
+    A subtask never creates labels; taking a label off the task takes it off
+    its subtasks. The database enforces this with triggers, not just the UI.
+  - Notes (up to 20,000 characters) save after a 700 ms pause, when you
+    leave the box, on Esc (which also closes the details), when you switch
+    or close the editor, and when the window closes.
+  - Under each title: its date, label chips and "📝 first line of the
+    notes"; clicking one opens the details on that field.
+  - In a subtask title, `#label` (if the task has that label) and `^date`
+    work like in the add box; any other `#word` stays in the title.
+- **Subtask dates count for their task**: an open subtask due today puts its
+  task in Today, an overdue one in Overdue, one within a week in Next 7 days;
+  "No target date" means neither the task nor any open subtask has a date.
+  The row shows "↳ ⏱ date" when a subtask is due before the task itself, and
+  sorting by target date uses the earliest date that still matters. Subtasks
+  get reminders too (the toast names their task).
+- While filtering by a label, folded tasks show the subtasks that carry it.
 - If a description contains checklist lines (`- [ ]`, `- [x]`, `1. [ ]`,
   outside code blocks), *Turn N checklist lines into subtasks* creates them
   and then removes exactly those lines; the rest of the description is left
@@ -152,6 +171,12 @@ the label list, dependencies). Images are not in the export: copy
 - **Reminders for targets that are already past when you set them** are not
   shown (for example a task added in the Today view after 09:00); otherwise
   every such task would pop up a notification a minute later.
+- **Typing a date with the keyboard**: while the year is being typed the
+  browser reports years like 0002 or 0203; those are ignored until the year
+  has four digits, then the date is saved at once.
+- **Folded tasks while filtering by labels** show the subtasks that carry
+  the label themselves (a subtask without labels does not count there; on
+  the matrix it counts with its task's labels, as specified).
 - **Label names** may not contain spaces, commas or `#` (they would break the
   `#label` syntax).
 - **Undo for "done"** restores the previous status; a task that is reopened
@@ -235,7 +260,7 @@ PATCH  /api/tasks/{id}             any of the above
 DELETE /api/tasks/{id}
 POST   /api/tasks/{id}/subtasks        {title} or {items: [title | {title, done?, position?, created_at?, completed_at?}]}
 POST   /api/tasks/{id}/subtasks/order  {ids: [...]}
-PATCH  /api/subtasks/{id}              {title?, done?}
+PATCH  /api/subtasks/{id}              {title?, done?, due_at?, labels?, notes?}
 DELETE /api/subtasks/{id}              (every subtask write answers with the whole parent task)
 PATCH  /api/labels/{id}            {name?, color?}   (renaming onto an existing name merges)
 DELETE /api/labels/{id}

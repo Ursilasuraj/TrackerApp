@@ -711,6 +711,158 @@ class SubtaskTests(UICase):
         self.assertEqual(self.server_subs(t['id']), ['draft kept'])
 
 
+class SubtaskDetailTests(UICase):
+    def setup_party(self, **sub):
+        t = self.task('Party', labels=['home', 'fun'], due_at='2030-01-20')
+        task = self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': [dict({'title': 'Cake'}, **sub), 'Music']}, expect=201)
+        return t, [s['id'] for s in task['subtasks']]
+
+    def wait_idle(self):
+        self.page.wait_for('TT.Q.pending === 0 && TT.net.inflight === 0 && TT.subtaskBusy() === false', timeout=8)
+
+    def sub(self, tid, i=0):
+        return self.server_task(tid)['subtasks'][i]
+
+    def test_details_date_labels_and_notes(self):
+        t, ids = self.setup_party()
+        p = self.open()
+        self.open_editor('Party')
+        p.click(f'[data-k="s{ids[0]}:more"]')
+        self.assertEqual(p.active(), f's{ids[0]}:date')
+        for ch in '01102030':
+            p.key(ch)
+        self.wait_idle()
+        self.assertEqual(self.sub(t['id'])['due_at'], '2030-01-10')
+        p.click(f'[data-k="s{ids[0]}:lbl:fun"]')
+        self.wait_idle()
+        self.assertEqual([l['name'] for l in self.sub(t['id'])['labels']], ['fun'])
+        p.click(f'[data-k="s{ids[0]}:notes"]')
+        p.type('First line of notes\nsecond line')
+        time.sleep(0.3)
+        self.assertEqual(self.sub(t['id'])['notes'], '', 'not saved before the 700 ms pause')
+        self.wait_idle()
+        self.assertEqual(self.sub(t['id'])['notes'], 'First line of notes\nsecond line')
+        meta = p.eval('document.querySelector(".sub .sub-meta").textContent')
+        for part in ('fun', '📝 First line of notes'):
+            self.assertIn(part, meta)
+        # The list row shows that a subtask is due before the task itself.
+        self.assertIn('↳ ⏱ 10 Jan', p.eval('document.querySelector("#list .row").textContent'))
+        # Esc in the notes saves and closes the details, back on the title.
+        p.type(' more')
+        p.key('Escape')
+        self.assertEqual(p.active(), f's{ids[0]}:title')
+        self.assertFalse(p.eval('!!document.querySelector(".sub-details")'))
+        self.wait_idle()
+        self.assertEqual(self.sub(t['id'])['notes'], 'First line of notes\nsecond line more')
+        # Clicking the 📝 under the title opens the details on the notes.
+        p.click(f'[data-k="s{ids[0]}:meta-notes"]')
+        self.assertEqual(p.active(), f's{ids[0]}:notes')
+
+    def test_notes_save_when_leaving_switching_and_closing(self):
+        t, ids = self.setup_party()
+        other = self.task('Other')
+        p = self.open()
+        self.open_editor('Party')
+        p.click(f'[data-k="s{ids[0]}:more"]')
+        p.click(f'[data-k="s{ids[0]}:notes"]')
+        p.type('saved on blur')
+        p.click('[data-k="ed:title"]')
+        self.wait_idle()
+        self.assertEqual(self.sub(t['id'])['notes'], 'saved on blur')
+        p.click(f'[data-k="s{ids[0]}:notes"]')
+        p.key('End', 'ctrl')
+        p.type(' + switch')
+        p.click(self.row_sel('Other'))
+        p.wait_for('TT.E.task && TT.E.task.title === "Other"')
+        self.wait_idle()
+        self.assertEqual(self.sub(t['id'])['notes'], 'saved on blur + switch')
+        p.click(self.row_sel('Party'))
+        p.wait_for('TT.E.task && TT.E.task.title === "Party"')
+        p.click(f'[data-k="s{ids[0]}:more"]')
+        p.click(f'[data-k="s{ids[0]}:notes"]')
+        p.key('End', 'ctrl')
+        p.type(' + close')
+        self.browser.close_page(p)
+        self.page = None
+        deadline = time.time() + 5
+        while time.time() < deadline and self.sub(t['id'])['notes'] != 'saved on blur + switch + close':
+            time.sleep(0.1)
+        self.assertEqual(self.sub(t['id'])['notes'], 'saved on blur + switch + close')
+        self.assertTrue(other)
+
+    def test_notes_box_survives_autosaves_and_redraws(self):
+        t, ids = self.setup_party()
+        p = self.open()
+        self.open_editor('Party')
+        p.click(f'[data-k="s{ids[0]}:more"]')
+        p.click(f'[data-k="s{ids[0]}:notes"]')
+        p.eval('(() => { const ta = document.activeElement; ta.__marker = 7; ta.style.height = "150px"; })()')
+        typed = ''
+        for i in range(4):
+            chunk = f'part {i} '
+            p.type(chunk)
+            typed += chunk
+            self.api('PATCH', f'/api/tasks/{t["id"]}', {'priority': ['high', 'low'][i % 2]})
+            time.sleep(0.9)    # past the notes autosave
+        self.wait_idle()
+        state = p.eval('(() => { const ta = document.querySelector(\'[data-k="s%d:notes"]\'); return {same: ta.__marker === 7,'
+                       ' focused: document.activeElement === ta, value: ta.value, height: ta.style.height, caret: ta.selectionStart}; })()' % ids[0])
+        self.assertEqual(state, {'same': True, 'focused': True, 'value': typed, 'height': '150px', 'caret': len(typed)})
+        self.assertEqual(self.sub(t['id'])['notes'], typed.rstrip())
+        # Ctrl+Z history survived the autosaves.
+        p.key('z', 'ctrl', commands=['undo'])
+        self.assertNotEqual(p.eval('document.activeElement.value'), typed)
+
+    def test_title_tokens_only_use_task_labels(self):
+        t, ids = self.setup_party()
+        p = self.open()
+        self.open_editor('Party')
+        p.click('[data-k="sub:add"]')
+        p.type('Call Bob #fun #nope ^+2d@9:15')
+        p.key('Enter')
+        self.wait_idle()
+        sub = self.sub(t['id'], 2)
+        self.assertEqual(sub['title'], 'Call Bob #nope')
+        self.assertEqual([l['name'] for l in sub['labels']], ['fun'])
+        self.assertTrue(sub['due_at'].endswith('T09:15'))
+        # Editing a title applies tokens too.
+        p.click(f'[data-k="s{ids[1]}:title"]')
+        p.key('End')
+        p.type(' #home')
+        p.key('Enter')
+        self.wait_idle()
+        sub = self.sub(t['id'], 1)
+        self.assertEqual((sub['title'], [l['name'] for l in sub['labels']]), ('Music', ['home']))
+
+    def test_removing_a_task_label_removes_it_from_subtasks(self):
+        t, ids = self.setup_party(labels=['fun'])
+        p = self.open()
+        self.open_editor('Party')
+        p.wait_for('document.querySelector(".sub .sub-meta").textContent.includes("fun")')
+        p.click('[data-k="ed:label-x:fun"]')
+        p.wait_for('!document.querySelector(".sub .sub-meta") || !document.querySelector(".sub .sub-meta").textContent.includes("fun")')
+        self.wait_idle()
+        self.assertEqual(self.sub(t['id'])['labels'], [])
+
+    def test_list_meta_opens_details_and_views_use_subtask_dates(self):
+        today = time.strftime('%Y-%m-%d')
+        t, ids = self.setup_party(due_at=today, notes='bring candles')
+        p = self.open()
+        p.click('[data-k="nav:today"]')
+        self.wait_rows(['Party'])
+        self.assertIn('↳ ⏱ Today', p.eval('document.querySelector("#list .row").textContent'))
+        p.click('.sub-badge')
+        p.click(f'[data-k="ls{ids[0]}:meta-notes"]')
+        p.wait_for(f'document.activeElement && document.activeElement.dataset.k === "s{ids[0]}:notes"')
+        # Label filter: folded tasks show their matching subtasks.
+        p.click('[data-k="nav:open"]')
+        p.click('.sub-badge')     # fold again
+        self.api('PATCH', f'/api/subtasks/{ids[1]}', {'labels': ['home']})
+        home = next(l['id'] for l in self.api('GET', '/api/meta')['labels'] if l['name'] == 'home')
+        p.click(f'[data-k="lbl:{home}:name"]')
+        p.wait_for('document.querySelectorAll(".mini-sub").length === 1 && document.querySelector(".mini-sub label").textContent === "Music"')
+
+
 class UpdateTests(UICase):
     def server_args(self):
         self.app = copy_app()

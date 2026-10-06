@@ -334,7 +334,7 @@ class Page:
 
     # -- keyboard ------------------------------------------------------------
 
-    def key(self, key, *mods, repeat=False):
+    def key(self, key, *mods, repeat=False, commands=None):
         modifiers = sum(MOD[m] for m in mods)
         if key in KEYS:
             vk, code, text = KEYS[key]
@@ -352,6 +352,8 @@ class Page:
         if text:
             down['text'] = text
             down['unmodifiedText'] = text
+        if commands:
+            down['commands'] = commands     # editing commands headless needs, e.g. ['undo']
         self.send('Input.dispatchKeyEvent', down)
         self.send('Input.dispatchKeyEvent', {'type': 'keyUp', 'key': key, 'code': code,
                                              'windowsVirtualKeyCode': vk, 'nativeVirtualKeyCode': vk,

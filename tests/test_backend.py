@@ -5,6 +5,7 @@ Every test uses scratch data and a test port; the real app is never touched.
 """
 
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -26,6 +27,7 @@ import reminders  # noqa: E402
 from helpers import APP_DIR, AppServer, copy_app, free_port, request, scratch_dir  # noqa: E402
 
 NOW = datetime(2026, 10, 6, 15, 0, 0)   # a Tuesday
+logging.getLogger('todotracker').addHandler(logging.NullHandler())   # expected warnings stay quiet
 
 
 class StoreCase(unittest.TestCase):
@@ -415,6 +417,151 @@ class SubtaskTests(StoreCase):
             self.assertEqual(c.execute('SELECT count(*) FROM subtasks').fetchone()[0], 0)
 
 
+class SubtaskDetailTests(StoreCase):
+    def party(self):
+        t = self.store.create_task('Party', labels=['home', 'fun'])
+        t, ids = self.store.add_subtasks(t['id'], ['Cake', 'Music'])
+        return t, ids
+
+    def test_dates_labels_notes_and_validation(self):
+        t, ids = self.party()
+        before = len(self.store.list_labels())
+        t = self.store.update_subtask(ids[0], {'due_at': '2026-10-08T09:30', 'labels': ['FUN'],
+                                               'notes': 'line one\r\nline two  \n\n'})
+        sub = t['subtasks'][0]
+        self.assertEqual((sub['due_at'], [l['name'] for l in sub['labels']]), ('2026-10-08T09:30', ['fun']))
+        self.assertEqual((sub['notes'], sub['note1'], sub['has_notes']), ('line one\nline two', 'line one', True))
+        for fields in ({'due_at': '2026-02-30'}, {'labels': ['work']}, {'labels': 'fun'},
+                       {'notes': 'x' * (db.MAX_NOTES + 1)}, {'notes': 5}):
+            with self.subTest(fields=str(fields)[:40]):
+                with self.assertRaises(db.ValidationError):
+                    self.store.update_subtask(ids[1], fields)
+        self.assertEqual(len(self.store.list_labels()), before, 'a subtask never creates labels')
+        listed = self.store.list_tasks()[0]['subtasks'][0]
+        self.assertNotIn('notes', listed)
+        self.assertEqual(listed['note1'], 'line one')
+
+    def test_subset_rule_is_enforced_by_the_database(self):
+        t, ids = self.party()
+        self.store.create_task('Other', labels=['work'])
+        work = next(l['id'] for l in self.store.list_labels() if l['name'] == 'work')
+        with self.store.write() as c:
+            with self.assertRaises(sqlite3.IntegrityError):
+                c.execute('INSERT INTO subtask_labels(subtask_id, label_id) VALUES (?, ?)', (ids[0], work))
+
+    def test_label_changes_reach_subtasks(self):
+        t, ids = self.party()
+        self.store.update_subtask(ids[0], {'labels': ['home', 'fun']})
+        t = self.store.update_task(t['id'], {'labels': ['home']})
+        self.assertEqual([l['name'] for l in t['subtasks'][0]['labels']], ['home'])
+        # Merging a label carries the subtask label along.
+        self.store.create_task('x', labels=['house'])
+        home = next(l['id'] for l in self.store.list_labels() if l['name'] == 'home')
+        self.store.update_label(home, name='House')
+        t = self.store.get_task(t['id'])
+        self.assertEqual([l['name'] for l in t['subtasks'][0]['labels']], ['house'])
+        house = next(l['id'] for l in self.store.list_labels() if l['name'] == 'house')
+        self.store.delete_label(house)
+        self.assertEqual(self.store.get_task(t['id'])['subtasks'][0]['labels'], [])
+
+    def test_subtask_dates_count_for_their_task(self):
+        s = self.store
+        a = s.create_task('sub due today')
+        s.add_subtasks(a['id'], [{'title': 'x', 'due_at': '2026-10-06'}])
+        b = s.create_task('sub overdue', due_at='2026-12-01')
+        s.add_subtasks(b['id'], [{'title': 'x', 'due_at': '2026-10-01'}])
+        c = s.create_task('sub this week')
+        s.add_subtasks(c['id'], [{'title': 'x', 'due_at': '2026-10-10'}])
+        d = s.create_task('only done sub has a date')
+        d, ids = s.add_subtasks(d['id'], [{'title': 'x', 'due_at': '2026-10-01', 'done': True}])
+        self.assertEqual(self.titles(view='today'), ['sub due today'])
+        self.assertEqual(self.titles(view='overdue'), ['sub overdue'])
+        self.assertEqual(sorted(self.titles(view='week')), ['sub due today', 'sub this week'])
+        self.assertEqual(self.titles(view='nodate'), ['only done sub has a date'])
+        self.assertEqual(self.titles(sort='due'), ['sub overdue', 'sub due today', 'sub this week',
+                                                   'only done sub has a date'])
+        self.assertEqual(s.list_tasks(view='overdue')[0]['eff_due'], '2026-10-01')
+        self.assertEqual(s.meta()['counts']['overdue'], 1)
+
+    def test_subtask_reminders(self):
+        s = self.store
+        t = s.create_task('Party')
+        t, ids = s.add_subtasks(t['id'], [{'title': 'call', 'due_at': '2026-10-06T16:00'},
+                                          {'title': 'done one', 'due_at': '2026-10-06T16:00', 'done': True},
+                                          {'title': 'date only', 'due_at': '2026-10-07'}])
+        other = s.create_task('Finished')
+        other, oids = s.add_subtasks(other['id'], [{'title': 'of a done task', 'due_at': '2026-10-06T16:00'}])
+        s.update_task(other['id'], {'status': 'done'})
+        got = s.due_reminders(datetime(2026, 10, 6, 16, 0))
+        self.assertEqual([(i['kind'], i['title'], i['task_title']) for i in got], [('subtask', 'call', 'Party')])
+        self.assertEqual(s.due_reminders(datetime(2026, 10, 6, 17, 0)), [])
+        got = s.due_reminders(datetime(2026, 10, 7, 9, 0))
+        self.assertEqual([i['title'] for i in got], ['date only'])
+        s.update_subtask(ids[0], {'due_at': '2026-10-08T10:00'})
+        self.assertEqual([i['title'] for i in s.due_reminders(datetime(2026, 10, 8, 10, 0))], ['call'])
+
+    def test_label_filter_marks_matching_subtasks(self):
+        t, ids = self.party()
+        self.store.update_subtask(ids[1], {'labels': ['fun']})
+        fun = next(l['id'] for l in self.store.list_labels() if l['name'] == 'fun')
+        hit = self.store.list_tasks(label_ids=[fun])[0]
+        self.assertEqual(hit['match_subs'], [ids[1]])
+        hit = self.store.list_tasks(label_ids=[fun], q='cake')[0]
+        self.assertEqual(hit['match_subs'], [])
+
+    def test_restore_and_export_keep_details(self):
+        t, ids = self.party()
+        t, new = self.store.add_subtasks(t['id'], [{'title': 'Back', 'position': 0, 'due_at': '2026-10-09',
+                                                    'labels': ['home'], 'notes': 'kept'}])
+        sub = t['subtasks'][0]
+        self.assertEqual((sub['title'], sub['due_at'], sub['notes'], [l['name'] for l in sub['labels']]),
+                         ('Back', '2026-10-09', 'kept', ['home']))
+        exported = self.store.export()['tasks'][0]['subtasks'][0]
+        self.assertEqual((exported['due_at'], exported['labels'], exported['notes']), ('2026-10-09', ['home'], 'kept'))
+        with self.assertRaises(db.ValidationError):
+            self.store.add_subtasks(t['id'], [{'title': 'bad', 'labels': ['nope']}])
+
+
+PHASE2_SCHEMA = """
+CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open', priority TEXT NOT NULL DEFAULT 'medium', created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL, due_at TEXT, completed_at TEXT, reminded_at TEXT);
+CREATE TABLE labels (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    color TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE task_labels (task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE, PRIMARY KEY (task_id, label_id));
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE subtasks (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL, completed_at TEXT);
+INSERT INTO tasks(title, created_at, updated_at) VALUES ('phase two', '2026-01-01T00:00:00', '2026-01-01T00:00:00');
+INSERT INTO subtasks(task_id, title, position, created_at) VALUES (1, 'old subtask', 0, '2026-01-01T00:00:00');
+"""
+
+
+class SubtaskMigrationTests(unittest.TestCase):
+    def test_upgrade_from_subtasks_without_details(self):
+        d = scratch_dir()
+        try:
+            path = os.path.join(d, 'todo.db')
+            c = sqlite3.connect(path)
+            c.executescript(PHASE2_SCHEMA)
+            c.close()
+            s = db.Store(path)
+            s.open()
+            t = s.get_task(1)
+            self.assertEqual(t['subtasks'][0]['title'], 'old subtask')
+            self.assertEqual((t['subtasks'][0]['due_at'], t['subtasks'][0]['notes']), (None, ''))
+            with s.read() as c:
+                names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
+            self.assertEqual(names, {n for n, _ in db.TRIGGERS})
+            t = s.update_subtask(t['subtasks'][0]['id'], {'notes': 'now possible'})
+            self.assertEqual(t['subtasks'][0]['notes'], 'now possible')
+            s.close()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 OLD_SCHEMA = """
 CREATE TABLE tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
@@ -623,6 +770,18 @@ class ServerTests(unittest.TestCase):
             with self.subTest(path=path, body=body):
                 st, data, _ = self.req(method, path, body)
                 self.assertEqual(st, status, data)
+
+    def test_subtask_detail_api(self):
+        st, t, _ = self.req('POST', '/api/tasks', {'title': 'Details', 'labels': ['alpha']})
+        st, task, _ = self.req('POST', f'/api/tasks/{t["id"]}/subtasks', {'title': 'sub'})
+        sid = task['subtasks'][0]['id']
+        st, task, _ = self.req('PATCH', f'/api/subtasks/{sid}', {'due_at': '2026-10-09', 'labels': ['alpha'], 'notes': 'n'})
+        self.assertEqual(st, 200, task)
+        sub = task['subtasks'][0]
+        self.assertEqual((sub['due_at'], sub['notes'], sub['labels'][0]['name']), ('2026-10-09', 'n', 'alpha'))
+        for body in ({'labels': ['beta']}, {'due_at': 'tomorrow'}, {'notes': None}, {'labels': [1]}):
+            st, data, _ = self.req('PATCH', f'/api/subtasks/{sid}', body)
+            self.assertEqual(st, 400, (body, data))
 
     def test_images(self):
         st, data, _ = self.req('POST', '/api/images', raw=PNG, headers={'Content-Type': 'image/png'})

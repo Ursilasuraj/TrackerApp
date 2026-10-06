@@ -23,7 +23,7 @@ import db as dbmod
 APP_NAME = 'TodoTracker'
 # Bump when the API or the schema changes. The page compares it with the
 # version it was written for (CLIENT_API in web/app.js).
-API = 2
+API = 3
 
 MAX_JSON = 4 * 1024 * 1024
 MAX_IMAGE = 25 * 1024 * 1024
@@ -156,7 +156,7 @@ def parse_id_list(text, what='labels'):
     return out
 
 
-SUBTASK_FIELDS = {'title': str, 'done': bool}
+SUBTASK_FIELDS = {'title': str, 'done': bool, 'due_at': (str, type(None)), 'labels': list, 'notes': str}
 
 TASK_FIELDS = {
     'title': str, 'description': str, 'status': str, 'priority': str,

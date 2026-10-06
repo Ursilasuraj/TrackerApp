@@ -475,6 +475,43 @@ button.chip { border: 0; cursor: pointer; }
 .sub:hover .sub-del, .sub:focus-within .sub-del, .sub-del:focus-visible { opacity: 1; }
 .sub-add { width: 100%; margin-top: 2px; }
 
+/* ---------------------------------------------------------------- subtask details */
+
+.sub-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 0 0 4px 48px; }
+.mini-sub .sub-meta { padding: 0; }
+.sub-meta button { cursor: pointer; }
+.sub-meta .badge { border: 0; font: inherit; font-size: 12px; line-height: 20px; }
+.meta-labels { display: inline-flex; flex-wrap: wrap; gap: 4px; padding: 0; border: 0; border-radius: 999px; background: none; }
+.note1 {
+  max-width: 280px; padding: 0 6px; border: 0; border-radius: 999px; background: transparent;
+  color: var(--text-2); font: inherit; font-size: 12px; line-height: 20px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.note1:hover { background: var(--surface-3); color: var(--text); }
+.sub-more { flex: none; }
+.sub-details {
+  display: flex; flex-direction: column; gap: 6px; margin: 2px 2px 8px 48px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--surface);
+}
+.sd-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.sd-row .ed-label { width: 52px; }
+.sub-details input[type="date"], .ed-grid input[type="date"] { width: 150px; }
+.sub-details input[type="time"], .ed-grid input[type="time"] { width: 112px; }
+.sd-labels { display: flex; flex-wrap: wrap; gap: 5px; }
+.chip.toggle {
+  border: 1px solid var(--field); background: var(--surface); color: var(--text-2);
+  font: inherit; font-size: 12px; line-height: 18px; cursor: pointer;
+}
+.chip.toggle:hover { background: var(--surface-2); }
+.chip.toggle.on {
+  border-color: color-mix(in srgb, var(--lc) 75%, var(--text)); font-weight: 600;
+  background: color-mix(in srgb, var(--lc) var(--chip-tint), var(--surface));
+  color: color-mix(in srgb, var(--lc) 50%, var(--text));
+}
+.chip.toggle.on::after { content: "✓"; }
+.sd-notes { width: 100%; min-height: 72px; font-size: 13px; }
+.hint { color: var(--text-2); font-size: 12.5px; }
+
 /* ---------------------------------------------------------------- toasts, lightbox */
 
 .toasts {
