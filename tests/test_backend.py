@@ -11,11 +11,11 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
 from datetime import datetime
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -23,6 +23,7 @@ sys.path.insert(0, HERE)
 
 import backup  # noqa: E402
 import db  # noqa: E402
+import platforms  # noqa: E402
 import reminders  # noqa: E402
 from helpers import APP_DIR, AppServer, copy_app, free_port, request, scratch_dir  # noqa: E402
 
@@ -1000,6 +1001,101 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.srv.data, 'backups', body['file'])))
 
 
+class PlatformTests(unittest.TestCase):
+    """OS helpers. Commands are argument lists, so task text never reaches a shell."""
+
+    EVIL = 'Pay "rent" $(touch /tmp/x) `id` \'; & | \\ %PATH% end'
+
+    def on(self, name):
+        p = mock.patch.multiple(platforms, IS_WINDOWS=name == 'windows', IS_MAC=name == 'mac',
+                                IS_LINUX=name == 'linux')
+        p.start()
+        self.addCleanup(p.stop)
+
+    def which(self, *found):
+        p = mock.patch.object(platforms.shutil, 'which', lambda name: '/usr/bin/' + name if name in found else None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_windows_toast_gets_texts_through_the_environment(self):
+        self.on('windows')
+        cmd = platforms.notification_command(self.EVIL, 'body')
+        self.assertIn('-EncodedCommand', cmd)
+        self.assertFalse(any('rent' in part for part in cmd))
+
+    def test_mac_notification_passes_texts_as_arguments(self):
+        self.on('mac')
+        cmd = platforms.notification_command(self.EVIL, 'Due today')
+        self.assertEqual(cmd[0], 'osascript')
+        self.assertEqual(cmd[-2:], [self.EVIL, 'Due today'])
+        self.assertFalse(any('rent' in part for part in cmd[:-2]))
+
+    def test_linux_notify_send(self):
+        self.on('linux')
+        self.which('notify-send', 'gdbus')
+        cmd = platforms.notification_command(self.EVIL, 'Due today')
+        self.assertEqual(cmd[0], 'notify-send')
+        self.assertEqual(cmd[-3:], ['--', self.EVIL, 'Due today'])
+
+    def test_linux_dbus_fallback_quotes_texts(self):
+        self.on('linux')
+        self.which('gdbus')
+        cmd = platforms.notification_command("it's \\ fine", 'two\nlines')
+        self.assertEqual(cmd[0], 'gdbus')
+        self.assertIn("'it\\'s \\\\ fine'", cmd)
+        self.assertIn("'two\\nlines'", cmd)
+        self.which()
+        self.assertIsNone(platforms.notification_command('a', 'b'))
+
+    def test_notify_can_be_suppressed(self):
+        with mock.patch.dict(os.environ, {'TODOTRACKER_NO_NOTIFY': '1'}), \
+                mock.patch.object(platforms, '_run', side_effect=AssertionError('must not run')):
+            self.assertTrue(platforms.notify('t', 'b'))
+
+    def test_window_commands(self):
+        url = 'http://127.0.0.1:8899/'
+        self.assertEqual(platforms.window_command(url, ('exe', '/usr/bin/chromium')),
+                         ['/usr/bin/chromium', '--app=' + url, '--window-size=1200,820'])
+        self.assertEqual(platforms.window_command(url, ('mac-app', '/Applications/Google Chrome.app')),
+                         ['open', '-n', '-a', '/Applications/Google Chrome.app', '--args',
+                          '--app=' + url, '--window-size=1200,820'])
+
+    def test_browser_choice(self):
+        with mock.patch.dict(os.environ, {'TODOTRACKER_BROWSER': '/opt/my/browser'}):
+            self.assertEqual(platforms.find_browser(), ('exe', '/opt/my/browser'))
+        env = dict(os.environ)
+        env.pop('TODOTRACKER_BROWSER', None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.on('linux')
+            self.which('chromium-browser', 'brave-browser')
+            self.assertEqual(platforms.find_browser(), ('exe', '/usr/bin/chromium-browser'))
+            self.which()
+            self.assertIsNone(platforms.find_browser())
+
+    def test_no_window_mode_opens_and_activates_nothing(self):
+        with mock.patch.dict(os.environ, {'TODOTRACKER_NO_WINDOW': '1'}), \
+                mock.patch.object(platforms, '_spawn', side_effect=AssertionError('must not start')), \
+                mock.patch.object(platforms, '_run', side_effect=AssertionError('must not run')):
+            self.assertTrue(platforms.open_window('http://127.0.0.1:1/'))
+            self.assertFalse(platforms.activate_window())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX process helpers')
+    def test_process_helpers(self):
+        self.assertTrue(platforms.process_alive(os.getpid()))
+        self.assertIn('python', platforms.process_cmdline(os.getpid()).lower())
+        child = subprocess.Popen([sys.executable, '-c', 'pass'])
+        child.wait(10)
+        self.assertFalse(platforms.process_alive(child.pid))
+        if not platforms.shutil.which('lsof'):
+            self.skipTest('lsof is not installed')
+        import socket
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            sock.listen(1)
+            self.assertEqual(platforms.port_owner(sock.getsockname()[1]), os.getpid())
+        self.assertIsNone(platforms.port_owner(free_port()))
+
+
 class InstanceTests(unittest.TestCase):
     """Single instance, updates and races (each test uses its own port and data)."""
 
@@ -1019,7 +1115,8 @@ class InstanceTests(unittest.TestCase):
         return srv
 
     def run_app(self, app_dir, port, data, timeout=40):
-        env = dict(os.environ, TODOTRACKER_DATA=data, TODOTRACKER_NO_WINDOW='1', PYTHONDONTWRITEBYTECODE='1')
+        env = dict(os.environ, TODOTRACKER_DATA=data, TODOTRACKER_NO_WINDOW='1', TODOTRACKER_NO_NOTIFY='1',
+                   PYTHONDONTWRITEBYTECODE='1')
         return subprocess.run([sys.executable, os.path.join(app_dir, 'todo.pyw'), '--port', str(port)],
                               env=env, capture_output=True, timeout=timeout)
 
@@ -1036,6 +1133,42 @@ class InstanceTests(unittest.TestCase):
         self.assertEqual(self.ping(srv.port)['pid'], srv.proc.pid)
         self.assertIn('already runs', srv.log())
         self.assertIn('opening window', srv.log())
+        # The running app was asked to show itself (the page then focuses quick add).
+        self.assertEqual(srv.api('GET', '/api/state')['hotkey'], 1)
+
+    @unittest.skipIf(os.name == 'nt', 'uses a shell script as the browser')
+    def test_window_opens_in_the_chosen_browser(self):
+        tmp = scratch_dir()
+        self.cleanups.append(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        calls = os.path.join(tmp, 'calls.txt')
+        fake = os.path.join(tmp, 'browser')
+        with open(fake, 'w') as f:
+            f.write('#!/bin/sh\necho "$@" >> "$TT_CALLS"\n')
+        os.chmod(fake, 0o755)
+        env = {'TODOTRACKER_NO_WINDOW': '0', 'TODOTRACKER_BROWSER': fake, 'TT_CALLS': calls,
+               'PATH': '/usr/bin:/bin'}   # no wmctrl/xdotool from elsewhere
+
+        def lines(n):
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if os.path.exists(calls):
+                    with open(calls) as f:
+                        got = f.read().splitlines()
+                    if len(got) >= n:
+                        return got
+                time.sleep(0.05)
+            self.fail('the browser was not started')
+
+        srv = self.start(env=env, background=False)
+        url = f'http://127.0.0.1:{srv.port}/'
+        self.assertEqual(lines(1), [f'--app={url} --window-size=1200,820'])
+        r = subprocess.run([sys.executable, os.path.join(APP_DIR, 'todo.pyw'), '--port', str(srv.port)],
+                           env=dict(os.environ, TODOTRACKER_DATA=srv.data, PYTHONDONTWRITEBYTECODE='1', **env),
+                           capture_output=True, timeout=40)
+        self.assertEqual(r.returncode, 0)
+        # Nothing can raise the existing window here, so the running app opened another.
+        self.assertEqual(len(lines(2)), 2)
+        self.assertEqual(srv.api('GET', '/api/state')['hotkey'], 1)
 
     def test_new_build_replaces_old_and_keeps_data(self):
         app = copy_app()
@@ -1086,7 +1219,8 @@ class InstanceTests(unittest.TestCase):
         port = free_port()
         data = scratch_dir()
         self.cleanups.append(lambda: shutil.rmtree(data, ignore_errors=True))
-        env = dict(os.environ, TODOTRACKER_DATA=data, TODOTRACKER_NO_WINDOW='1', PYTHONDONTWRITEBYTECODE='1')
+        env = dict(os.environ, TODOTRACKER_DATA=data, TODOTRACKER_NO_WINDOW='1', TODOTRACKER_NO_NOTIFY='1',
+                   PYTHONDONTWRITEBYTECODE='1')
         procs = [subprocess.Popen([sys.executable, os.path.join(APP_DIR, 'todo.pyw'), '--background',
                                    '--port', str(port)], env=env, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL) for _ in range(3)]
@@ -1144,7 +1278,8 @@ class InstanceTests(unittest.TestCase):
         p.kill()
         p.wait(5)
         p = fake('todo.pyw')
-        env = dict(os.environ, TODOTRACKER_DATA=data, TODOTRACKER_NO_WINDOW='1', PYTHONDONTWRITEBYTECODE='1')
+        env = dict(os.environ, TODOTRACKER_DATA=data, TODOTRACKER_NO_WINDOW='1', TODOTRACKER_NO_NOTIFY='1',
+                   PYTHONDONTWRITEBYTECODE='1')
         new = subprocess.Popen([sys.executable, os.path.join(APP_DIR, 'todo.pyw'), '--background',
                                 '--port', str(port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.cleanups.append(lambda: new.kill())

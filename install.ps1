@@ -29,14 +29,14 @@ if (-not (Test-Path -LiteralPath $Script)) {
 }
 
 function Test-Python([string]$Pythonw) {
-    # A usable pythonw.exe has a python.exe next to it that reports 3.8 or newer.
+    # A usable pythonw.exe has a python.exe next to it that reports 3.9 or newer.
     if (-not $Pythonw -or -not (Test-Path -LiteralPath $Pythonw)) { return $false }
     $python = Join-Path (Split-Path -Parent $Pythonw) 'python.exe'
     if (-not (Test-Path -LiteralPath $python)) { return $true }
     $version = & $python -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $version) { return $false }
     $parts = "$version".Trim().Split('.')
-    return ([int]$parts[0] -gt 3) -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -ge 8)
+    return ([int]$parts[0] -gt 3) -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -ge 9)
 }
 
 function Find-Pythonw {
@@ -77,6 +77,8 @@ function New-AppShortcut([string]$Path, [string]$Arguments, [string]$Description
     $link.Arguments = $Arguments
     $link.WorkingDirectory = $AppDir
     $link.Description = $Description
+    $icon = Join-Path $AppDir 'web\icon.ico'
+    if (Test-Path -LiteralPath $icon) { $link.IconLocation = "$icon,0" }
     $link.Save()
     Write-Host "Created: $Path"
 }

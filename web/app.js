@@ -1677,7 +1677,7 @@
     if (BOOT.api >= CLIENT_API) return;
     const banner = $('#banner');
     banner.textContent = 'TodoTracker was updated, but the old version is still running. '
-      + 'Start TodoTracker again (Start menu) to switch to the new version; some features are hidden until then.';
+      + 'Start TodoTracker again to switch to the new version; some features are hidden until then.';
     banner.className = 'banner info';
     banner.hidden = false;
     banner.dataset.kind = 'version';

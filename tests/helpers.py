@@ -70,7 +70,8 @@ class AppServer:
         self.data = data_dir or scratch_dir('tt-data-')
         self.app_dir = app_dir
         self.own_data = data_dir is None
-        e = dict(os.environ, TODOTRACKER_DATA=self.data, TODOTRACKER_NO_WINDOW='1', PYTHONDONTWRITEBYTECODE='1')
+        e = dict(os.environ, TODOTRACKER_DATA=self.data, TODOTRACKER_NO_WINDOW='1', TODOTRACKER_NO_NOTIFY='1',
+                 PYTHONDONTWRITEBYTECODE='1')
         e.pop('TODOTRACKER_NO_FTS', None)
         e.update(env or {})
         args = [sys.executable, os.path.join(app_dir, 'todo.pyw'), '--port', str(self.port)]
@@ -132,11 +133,16 @@ class AppServer:
             shutil.rmtree(self.data, ignore_errors=True)
 
 
-def copy_app(dest=None):
-    """A copy of the app folder (code only) for update/replacement tests."""
+def copy_app(dest=None, tools=False):
+    """A copy of the app folder (code only) for update/replacement tests;
+    tools=True adds the installers and tools/."""
     dest = dest or scratch_dir('tt-app-')
+    os.makedirs(dest, exist_ok=True)
     for name in os.listdir(APP_DIR):
-        if name.endswith(('.py', '.pyw')):
+        if name.endswith(('.py', '.pyw')) or (tools and name.endswith('.sh')):
             shutil.copy2(os.path.join(APP_DIR, name), dest)
     shutil.copytree(os.path.join(APP_DIR, 'web'), os.path.join(dest, 'web'), dirs_exist_ok=True)
+    if tools:
+        shutil.copytree(os.path.join(APP_DIR, 'tools'), os.path.join(dest, 'tools'), dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns('__pycache__'))
     return dest

@@ -1,69 +1,30 @@
-"""Reminders: a Windows toast when a task's (or subtask's) target time arrives.
+"""Reminders: a desktop notification when a task's (or subtask's) target time arrives.
 
 Every 60 seconds (first check 20 s after start) the not-done items whose
 target time has arrived and that were not reminded yet are claimed and shown.
 Date-only targets remind at 09:00. More than three at once become a single
-summary toast.
+summary notification. How a notification is shown depends on the OS
+(platforms.notify).
 """
 
-import base64
 import logging
-import os
-import subprocess
 import threading
 from datetime import date, timedelta
 
 import db as dbmod
+import platforms
 
 log = logging.getLogger('todotracker.reminders')
 
 FIRST_CHECK_DELAY = 20
 INTERVAL = 60
 MAX_SINGLE = 3
-APP_ID = r'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
-CREATE_NO_WINDOW = 0x08000000
 WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
-# Texts arrive through environment variables, so nothing typed into a task
-# title can change the script.
-TOAST_SCRIPT = r'''
-$ErrorActionPreference = 'Stop'
-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
-$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
-$texts = $xml.GetElementsByTagName('text')
-$texts.Item(0).AppendChild($xml.CreateTextNode($env:TT_TOAST_TITLE)) | Out-Null
-$texts.Item(1).AppendChild($xml.CreateTextNode($env:TT_TOAST_BODY)) | Out-Null
-$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:TT_TOAST_APPID).Show($toast)
-'''
-
 
 def show_toast(title, body):
-    """Show a Windows toast through a hidden powershell.exe (WinRT API)."""
-    title, body = title[:200], body[:400]
-    if os.name != 'nt':
-        log.info('toast: %s | %s', title, body)
-        return True
-    exe = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'),
-                       'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-    env = dict(os.environ, TT_TOAST_TITLE=title, TT_TOAST_BODY=body, TT_TOAST_APPID=APP_ID)
-    encoded = base64.b64encode(TOAST_SCRIPT.encode('utf-16-le')).decode('ascii')
-    try:
-        result = subprocess.run(
-            [exe, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-             '-WindowStyle', 'Hidden', '-EncodedCommand', encoded],
-            env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=60,
-            creationflags=CREATE_NO_WINDOW)
-    except Exception:
-        log.exception('toast could not be shown')
-        return False
-    if result.returncode != 0:
-        log.warning('toast failed (%s): %s', result.returncode,
-                    result.stderr.decode('utf-8', 'replace')[:600])
-        return False
-    return True
+    return platforms.notify(title, body)
 
 
 def describe_due(due, now):

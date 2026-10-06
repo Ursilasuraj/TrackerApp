@@ -39,10 +39,11 @@ STATIC_TYPES = {
     '.svg': 'image/svg+xml',
     '.png': 'image/png',
     '.ico': 'image/x-icon',
+    '.webmanifest': 'application/manifest+json',
 }
 IMAGE_TYPES = {'png': 'image/png', 'jpg': 'image/jpeg', 'gif': 'image/gif',
                'webp': 'image/webp', 'bmp': 'image/bmp'}
-STATIC_NAME_RE = re.compile(r'^/([A-Za-z0-9_-]+\.(?:html|js|css|svg|png|ico))$')
+STATIC_NAME_RE = re.compile(r'^/([A-Za-z0-9_-]+\.(?:html|js|css|svg|png|ico|webmanifest))$')
 IMAGE_NAME_RE = re.compile(r'^/images/([0-9a-f]{32}\.(?:png|jpg|gif|webp|bmp))$')
 
 
@@ -83,6 +84,7 @@ class App:
         self.epoch = f'{os.getpid()}-{int(time.time() * 1000)}'
         self.changes = 0
         self.hotkey_presses = 0
+        self.on_show = None           # set by todo.pyw: bring the window to the front
         self.stopping = threading.Event()
         self.httpd = None
         self._lock = threading.Lock()
@@ -198,6 +200,7 @@ class Handler(BaseHTTPRequestHandler):
         ('POST', r'/api/images', 'api_upload_image'),
         ('POST', r'/api/backup', 'api_backup'),
         ('POST', r'/api/shutdown', 'api_shutdown'),
+        ('POST', r'/api/show', 'api_show'),
     ]
     COMPILED = [(m, re.compile('^' + p + '$'), h) for m, p, h in ROUTES]
 
@@ -405,6 +408,12 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {'ok': True})
         self.wfile.flush()
         self.app.request_shutdown()
+
+    def api_show(self, query):
+        """The app was started again: front its window (or open one)."""
+        self._json_body()
+        result = self.app.on_show() if self.app.on_show else 'unavailable'
+        self._send_json(200, {'ok': True, 'result': result})
 
     def api_backup(self, query):
         self._json_body()

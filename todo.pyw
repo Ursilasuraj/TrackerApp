@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
 """TodoTracker - a personal TODO app (Python standard library only).
 
-    pythonw todo.pyw                start, or show the window of the running app
-    pythonw todo.pyw --background   start without a window (used at login)
-    python todo.pyw --port 8899     another port (tests; never test on 8765)
+Windows, macOS and Linux:
+
+    pythonw todo.pyw                start, or bring the running app's window to the front
+    python3 todo.pyw --background   start without a window (used at login)
+    python3 todo.pyw --port 8899    another port (tests; never test on 8765)
 
 Data lives in the "data" folder next to this file; the environment variable
 TODOTRACKER_DATA points it somewhere else.
 """
+
+import sys
+
+if sys.version_info < (3, 9):
+    sys.exit('TodoTracker needs Python 3.9 or newer.')
 
 import argparse
 import hashlib
 import json
 import logging
 import os
-import shutil
-import signal
 import socket
-import subprocess
-import sys
 import threading
 import time
 import urllib.request
-import webbrowser
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
+import platforms  # noqa: E402  (needs APP_DIR on sys.path)
+
 DEFAULT_PORT = 8765
-CREATE_NO_WINDOW = 0x08000000
-DETACHED_PROCESS = 0x00000008
-CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 log = logging.getLogger('todotracker')
 # Never use a proxy for 127.0.0.1 (urllib reads the Windows proxy settings).
@@ -143,98 +144,6 @@ def wait_port_free(port, timeout):
     return not port_in_use(port)
 
 
-def process_cmdline(pid):
-    if os.name == 'nt':
-        try:
-            out = subprocess.run(
-                ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-                 f'(Get-CimInstance Win32_Process -Filter "ProcessId={int(pid)}").CommandLine'],
-                capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW)
-            return out.stdout.strip()
-        except Exception:
-            log.exception('could not read the command line of process %s', pid)
-            return ''
-    try:
-        with open(f'/proc/{int(pid)}/cmdline', 'rb') as f:
-            return f.read().replace(b'\0', b' ').decode('utf-8', 'replace')
-    except OSError:
-        return ''
-
-
-def port_owner(port):
-    """PID of the process listening on 127.0.0.1:port (Windows: netstat)."""
-    if os.name != 'nt':
-        return None
-    try:
-        out = subprocess.run(['netstat', '-ano', '-p', 'TCP'], capture_output=True, text=True,
-                             timeout=20, stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW).stdout
-    except Exception:
-        return None
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 5 and parts[1] == f'127.0.0.1:{port}' and parts[3].upper() == 'LISTENING':
-            try:
-                return int(parts[4])
-            except ValueError:
-                return None
-    return None
-
-
-def process_alive(pid):
-    if os.name == 'nt':
-        import ctypes
-        from ctypes import wintypes
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        kernel32.WaitForSingleObject.restype = wintypes.DWORD
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        SYNCHRONIZE = 0x00100000
-        handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
-        if not handle:
-            return False
-        try:
-            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT: still running
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    try:
-        with open(f'/proc/{int(pid)}/stat') as f:
-            return f.read().split(')')[-1].split()[0] != 'Z'
-    except OSError:
-        return True
-
-
-def wait_process_exit(pid, timeout):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not process_alive(pid):
-            return True
-        time.sleep(0.1)
-    return not process_alive(pid)
-
-
-def kill_process(pid):
-    if os.name == 'nt':
-        subprocess.run(['taskkill', '/PID', str(int(pid)), '/F'], capture_output=True,
-                       stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
-    else:
-        try:
-            os.kill(int(pid), signal.SIGTERM)
-            if not wait_process_exit(pid, 3):
-                os.kill(int(pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-
-
 def stop_instance(port, info):
     """Ask an older instance to stop; force it only if it is really todo.pyw."""
     pid = info.get('pid')
@@ -246,82 +155,26 @@ def stop_instance(port, info):
         log.warning('shutdown request failed: %s', e)
     if wait_port_free(port, 10):
         if pid:
-            wait_process_exit(pid, 10)
+            platforms.wait_process_exit(pid, 10)
         return True
-    owner = port_owner(port) or pid
-    if owner and 'todo.pyw' in process_cmdline(owner).lower():
+    owner = platforms.port_owner(port) or pid
+    if owner and 'todo.pyw' in platforms.process_cmdline(owner).lower():
         log.warning('process %s still owns port %s; stopping it', owner, port)
-        kill_process(owner)
-        wait_process_exit(owner, 5)
+        platforms.kill_process(owner)
+        platforms.wait_process_exit(owner, 5)
         return wait_port_free(port, 10)
     log.error('port %s is still in use after the shutdown request', port)
     return False
 
 
-# ---------------------------------------------------------------------------
-# Window
-# ---------------------------------------------------------------------------
-
-def find_edge():
-    if os.name != 'nt':
-        return None
-    candidates = []
+def show_running(port, url):
+    """Ask the running instance to show its window (an old one: open another)."""
     try:
-        import winreg
-        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-            try:
-                with winreg.OpenKey(hive, r'SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe') as key:
-                    candidates.append(winreg.QueryValue(key, None))
-            except OSError:
-                pass
-    except ImportError:
-        pass
-    for env in ('ProgramFiles(x86)', 'ProgramFiles', 'LOCALAPPDATA'):
-        base = os.environ.get(env)
-        if base:
-            candidates.append(os.path.join(base, 'Microsoft', 'Edge', 'Application', 'msedge.exe'))
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    return shutil.which('msedge')
-
-
-def open_window(url):
-    """Open the UI as an Edge app window (or in the default browser)."""
-    if os.environ.get('TODOTRACKER_NO_WINDOW') == '1':
-        log.info('opening window: %s (suppressed by TODOTRACKER_NO_WINDOW)', url)
-        return True
-    log.info('opening window: %s', url)
-    edge = find_edge()
-    if edge:
-        try:
-            subprocess.Popen([edge, f'--app={url}', '--window-size=1200,820'],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, close_fds=True,
-                             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-            return True
-        except OSError:
-            log.exception('could not start Edge; using the default browser')
-    try:
-        return webbrowser.open(url)
-    except Exception:
-        log.exception('could not open a browser')
-        return False
-
-
-def message_box(text):
-    log.error(text)
-    if os.name == 'nt':
-        try:
-            import ctypes
-            from ctypes import wintypes
-            user32 = ctypes.WinDLL('user32')
-            user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
-            user32.MessageBoxW(None, text, 'TodoTracker', 0x10)
-        except Exception:
-            pass
-    elif sys.stderr is not None:
-        print(text, file=sys.stderr)
+        http_json(port, '/api/show', method='POST', timeout=20)
+        return
+    except Exception as e:
+        log.warning('show request failed: %s', e)
+    platforms.open_window(url)
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +216,12 @@ def main(argv=None):
     if info:
         if should_replace(info, server.API, build, ddir):
             if not stop_instance(port, info):
-                message_box(f'TodoTracker could not replace the running copy on port {port}.')
+                platforms.message_box(f'TodoTracker could not replace the running copy on port {port}.')
                 return 1
         else:
             log.info('TodoTracker already runs (pid %s); showing its window', info.get('pid'))
             if not args.background:
-                open_window(url)
+                show_running(port, url)
             return 0
 
     httpd = None
@@ -384,10 +237,10 @@ def main(argv=None):
                 # Another launch won the race: show its window instead.
                 log.info('another instance (pid %s) started first', other.get('pid'))
                 if not args.background:
-                    open_window(url)
+                    show_running(port, url)
                 return 0
             if time.monotonic() > deadline:
-                message_box(f'TodoTracker could not start: port {port} is in use ({e}).')
+                platforms.message_box(f'TodoTracker could not start: port {port} is in use ({e}).')
                 return 1
             time.sleep(0.25)
 
@@ -398,7 +251,7 @@ def main(argv=None):
     except Exception:
         log.exception('database could not be opened')
         httpd.server_close()
-        message_box('TodoTracker could not open its database (see data/todo.log).')
+        platforms.message_box('TodoTracker could not open its database (see data/todo.log).')
         return 1
 
     db_path = os.path.join(ddir, 'todo.db')
@@ -411,19 +264,20 @@ def main(argv=None):
     backup.BackupThread(db_path, backups_dir, app.stopping).start()
     reminders.ReminderThread(store, app.stopping).start()
 
-    def on_hotkey():
-        app.hotkey_pressed()
-        hwnd = hotkey.find_app_window()
-        if hwnd:
-            hotkey.focus_window(hwnd)
-        else:
-            open_window(url)
+    def show_window():
+        """Ctrl+Alt+T, or the app started again: front the window or open one."""
+        app.hotkey_pressed()          # the page puts the cursor in quick add
+        if platforms.activate_window():
+            return 'activated'
+        platforms.open_window(url)
+        return 'opened'
 
-    hk = hotkey.HotkeyThread(on_hotkey)
+    app.on_show = show_window
+    hk = hotkey.HotkeyThread(show_window)
     hk.start()
 
     if not args.background:
-        open_window(url)
+        platforms.open_window(url)
     log.info('listening on %s', url)
     try:
         httpd.serve_forever(poll_interval=0.25)
