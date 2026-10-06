@@ -2106,7 +2106,7 @@
     return '<section class="ed-subtasks" aria-labelledby="ed-subs-title">'
       + '<div class="ed-section-title"><span id="ed-subs-title">Subtasks</span>'
       + (total ? '<span class="sub-count">' + done + ' of ' + total + ' done</span>' : '') + '</div>'
-      + (total ? '<div class="progress" role="progressbar" aria-label="Subtasks done" aria-valuemin="0" aria-valuemax="' + total
+      + (total ? '<div class="sub-progress" role="progressbar" aria-label="Subtasks done" aria-valuemin="0" aria-valuemax="' + total
         + '" aria-valuenow="' + done + '"><span style="width:' + pct + '%"></span></div>' : '')
       + '<ul class="subtasks" data-task="' + t.id + '">' + subs.map((s) => subtaskRowHTML(t, s, now)).join('') + '</ul>'
       + '<input type="text" class="sub-add" data-k="sub:add" maxlength="500" autocomplete="off"'

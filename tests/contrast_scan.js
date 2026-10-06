@@ -162,10 +162,23 @@
     }
   }
 
+  // Badges and chips must show their whole text (a stray class can squeeze
+  // them, as a shared ".progress" class once did).
+  function checkClipped(failures) {
+    for (const el of document.querySelectorAll('.badge, .chip, .qtag, .suggest-chip, .prio-badge')) {
+      if (!visible(el)) continue;
+      const size = parseFloat(getComputedStyle(el).fontSize);
+      if (el.clientHeight < size || el.scrollHeight > el.clientHeight + 1) {
+        failures.push('clipped (' + el.clientHeight + 'px): ' + describe(el));
+      }
+    }
+  }
+
   window.__ttContrastScan = function () {
     const failures = [];
     checkText(failures);
     checkUI(failures);
+    checkClipped(failures);
     return Array.from(new Set(failures));
   };
 
