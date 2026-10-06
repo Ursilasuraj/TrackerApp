@@ -89,12 +89,28 @@
     return [url.slice(0, end), url.slice(end)];
   }
 
+  // Pages without a server (the Android app) keep pictures on the device:
+  // setImageSource(fn) maps "/images/…" to a URL the page can show. fn
+  // returns null while a picture is still loading; the <img> carries
+  // data-local so the page can fill it in when it is there.
+  const BLANK = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+  let imageSource = null;
+
+  function setImageSource(fn) { imageSource = fn; }
+
+  function imageTag(url, alt) {
+    if (imageSource && url.startsWith('/images/')) {
+      return '<img src="' + (imageSource(url) || BLANK) + '" data-local="' + url + '" alt="' + alt + '" loading="lazy">';
+    }
+    return '<img src="' + url + '" alt="' + alt + '" loading="lazy">';
+  }
+
   // `text` is already HTML-escaped.
   function inline(text) {
     const holds = [];
     text = text.replace(CODE_RE, (m, ticks, code) => hold(holds, '<code>' + code + '</code>'));
     text = text.replace(IMAGE_RE, (m, alt, url) => (okUrl(url, true)
-      ? hold(holds, '<img src="' + url + '" alt="' + alt + '" loading="lazy">')
+      ? hold(holds, imageTag(url, alt))
       : hold(holds, m)));
     text = text.replace(LINK_RE, (m, label, url) => (okUrl(url, false)
       ? hold(holds, '<a href="' + url + '" target="_blank" rel="noopener noreferrer">'
@@ -282,5 +298,5 @@
   }
 
   return { render, inline: (s) => inline(escapeHtml(normalize(s))), escapeHtml, stripEmphasis,
-    findChecklist, removeLines, okUrl };
+    findChecklist, removeLines, okUrl, setImageSource };
 });

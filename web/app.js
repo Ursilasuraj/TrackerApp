@@ -16,6 +16,13 @@
   const MD = window.TTMarkdown;
   const ROOT = document.documentElement;
   const BOOT = { api: Number(ROOT.dataset.api) || 0, build: ROOT.dataset.build || '' };
+  // "local": no server (the Android app). The API then runs in this page
+  // (localdb.js) and keeps the data in IndexedDB.
+  const MODE = ROOT.dataset.mode === 'local' ? 'local' : 'server';
+  const LOCAL = MODE === 'local' && window.TTLocal ? window.TTLocal.openBrowser({ build: BOOT.build, api: BOOT.api }) : null;
+  let localNow = null;                 // the opened local data, once it is open
+  if (LOCAL) LOCAL.then((l) => { localNow = l; }, () => {});
+  const ANDROID = window.TodoTrackerAndroid || null;     // the app's bridge (reminders, saving files)
   const CLIENT_API = 5;            // the server API this page is written for
   const NARROW = window.matchMedia('(max-width: 760px)');           // phone layout
   const TOUCH = window.matchMedia('(pointer: coarse)');             // finger, not mouse
@@ -57,6 +64,7 @@
   const net = { inflight: 0, loading: 0, refreshDue: false, own: new Set(), lastChanges: null, epoch: null, failures: 0 };
 
   async function api(method, path, body, opts) {
+    if (LOCAL) return localApi(method, path, body);
     const init = { method, headers: {} };
     const write = method !== 'GET';
     if (write) init.headers['X-Todo'] = '1';
@@ -92,6 +100,157 @@
       throw err;
     }
     return data;
+  }
+
+  // One window at a time may change the data on this device: two would each
+  // keep a copy and overwrite each other's changes. Others show the same
+  // tasks (they re-read storage) and say where to make changes.
+  let lockGranted = null;
+  let lockHeld = false;
+
+  function writeLock() {
+    if (!lockGranted) {
+      lockGranted = new Promise((resolve) => {
+        if (!navigator.locks) { lockHeld = true; resolve(); return; }
+        navigator.locks.request('todotracker-local-data', () => {
+          lockHeld = true;
+          resolve();
+          setOtherWindow(false);
+          return new Promise(() => {});      // held until this page goes away
+        });
+        setTimeout(() => { if (!lockHeld) setOtherWindow(true); }, 1500);
+      });
+    }
+    return lockGranted;
+  }
+
+  function setOtherWindow(on) {
+    const banner = $('#banner');
+    if (on) {
+      banner.textContent = 'TodoTracker is open in another window. This one shows the same tasks; make changes in the other one.';
+      banner.className = 'banner info';
+      banner.hidden = false;
+      banner.dataset.kind = 'other-window';
+    } else if (banner.dataset.kind === 'other-window') {
+      banner.hidden = true;
+      banner.dataset.kind = '';
+    }
+  }
+
+  async function localApi(method, path, body) {
+    const write = method !== 'GET';
+    let res;
+    if (write) net.inflight++;
+    try {
+      const local = await LOCAL;
+      if (write) {
+        if (!lockHeld) {
+          await Promise.race([writeLock(), new Promise((resolve) => setTimeout(resolve, 2000))]);
+          if (!lockHeld) {
+            const err = new Error('TodoTracker is open in another window; make changes there.');
+            err.status = 409;
+            throw err;
+          }
+        }
+        await local.sync();          // another window may have written before this one got the turn
+      }
+      res = await local.api.handle(method, path, body);
+    } catch (e) {
+      if (write) net.inflight--;
+      if (e.status) throw e;
+      const err = new Error('The data on this device could not be opened (' + (e && e.message || e) + ').');
+      err.network = true;
+      throw err;
+    }
+    for (const n of res.changes) net.own.add(n);
+    if (write) net.inflight--;
+    if (res.status >= 400) {
+      const err = new Error((res.data && res.data.error) || ('Request failed (' + res.status + ').'));
+      err.status = res.status;
+      throw err;
+    }
+    if (method === 'POST' && path === '/api/images' && body instanceof Blob) {
+      localImages.set(res.data.url, URL.createObjectURL(body));   // shown at once, no reload from storage
+    }
+    if (write) scheduleLocalReminders();
+    return res.data;
+  }
+
+  // Pictures kept on the device: "/images/…" -> blob: URL (a Promise while loading).
+  const localImages = new Map();
+
+  function localImageSrc(url) {
+    const v = localImages.get(url);
+    if (typeof v === 'string') return v;
+    if (!v) localImages.set(url, loadLocalImage(url));
+    return null;
+  }
+
+  async function loadLocalImage(url) {
+    let src = '';
+    try {
+      const blob = await (await LOCAL).images.get(url.slice('/images/'.length));
+      if (blob) src = URL.createObjectURL(blob);
+    } catch (e) { /* stays blank */ }
+    localImages.set(url, src);
+    if (src) for (const img of $$('img[data-local="' + CSS.escape(url) + '"]')) img.src = src;
+  }
+
+  if (LOCAL) MD.setImageSource(localImageSrc);
+
+  /** Save text as a file: the Android app asks where; browsers download it. */
+  function saveFile(name, text, type) {
+    if (ANDROID && ANDROID.saveFile) { ANDROID.saveFile(name, type, text); return; }
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  // ------------------------------------------------- reminders (local mode)
+
+  // The page reminds while it is open; the Android app also gets the
+  // reminders still to come, so its alarm clock rings while it is closed
+  // (it shows each one once, whoever asks first).
+  let reminderTimer = 0;
+
+  function scheduleLocalReminders() {
+    if (!LOCAL) return;
+    clearTimeout(reminderTimer);
+    reminderTimer = setTimeout(checkLocalReminders, 1500);
+  }
+
+  async function checkLocalReminders() {
+    clearTimeout(reminderTimer);
+    if (!lockHeld) return;                 // the window that writes also reminds
+    let local;
+    try { local = await LOCAL; await local.sync(); } catch (e) { return; }
+    const now = new Date();
+    const due = local.store.dueReminders(now);
+    if (due.length) {
+      const shown = window.TTLocal.compose(due, now);
+      if (ANDROID && ANDROID.notify) {
+        ANDROID.notify(JSON.stringify(shown.map(([title, body], i) => ({
+          key: due.length > 3 ? 'summary@' + local.store.data.changes : due[i].kind[0] + due[i].id + '@' + due[i].due_at, title, body }))));
+      } else if (window.Notification && Notification.permission === 'granted') {
+        for (const [title, body] of shown) { try { new Notification(title, { body }); } catch (e) { /* not allowed here */ } }
+      }
+    }
+    if (ANDROID && ANDROID.schedule) {
+      const upcoming = local.store.upcomingReminders(64).map((r) => {
+        const at = new Date(Number(r.at.slice(0, 4)), Number(r.at.slice(5, 7)) - 1, Number(r.at.slice(8, 10)),
+          Number(r.at.slice(11, 13)), Number(r.at.slice(14, 16)));
+        const item = r.key[0] === 't' ? { kind: 'task', title: r.title, due_at: r.due_at }
+          : { kind: 'subtask', title: r.title, due_at: r.due_at, task_title: r.task_title };
+        const [title, body] = window.TTLocal.compose([item], at)[0];
+        return { key: r.key + '@' + r.due_at, at: at.getTime(), title, body };
+      });
+      ANDROID.schedule(JSON.stringify(upcoming));
+    }
   }
 
   // ------------------------------------------------- deferred redraws
@@ -431,7 +590,7 @@
         + '<div class="side-actions">'
         + '<button type="button" class="btn" data-act="export" data-k="side:export">Export JSON</button>'
         + (supports('import') && TT.importJSON ? '<button type="button" class="btn" data-act="import" data-k="side:import">Import JSON</button>' : '')
-        + '<button type="button" class="btn" data-act="backup" data-k="side:backup">Back up now</button>'
+        + (LOCAL ? '' : '<button type="button" class="btn" data-act="backup" data-k="side:backup">Back up now</button>')
         + '</div>'
         + themeSwitchHTML()
         + '</div>';
@@ -533,7 +692,14 @@
     if (E.task) reloadEditor();
   }
 
-  function exportJSON() {
+  async function exportJSON() {
+    if (LOCAL) {
+      try {
+        const data = await api('GET', '/api/export');
+        saveFile('todotracker-export-' + P.ymd(new Date()) + '.json', JSON.stringify(data, null, 1), 'application/json');
+      } catch (e) { errorToast('Export failed:', e); }
+      return;
+    }
     const a = document.createElement('a');
     a.href = '/api/export';
     a.download = '';
@@ -564,7 +730,10 @@
           + s.labels + ' new labels and ' + s.dependencies + ' links.';
         if (s.skipped) msg += ' Skipped ' + s.skipped + (s.skipped === 1 ? ' task that was' : ' tasks that were') + ' already here.';
         if (s.invalid) msg += ' ' + s.invalid + ' entries could not be read.';
-        if (s.missing_images) msg += ' ' + s.missing_images + ' pictures are missing: copy the old data\\images folder too.';
+        if (s.missing_images) {
+          msg += ' ' + s.missing_images + (LOCAL ? ' pictures are not on this device (exports do not include pictures).'
+            : ' pictures are missing: copy the images folder from the old data folder too.');
+        }
         toast(msg, { timeout: 15000 });
         refresh();
       } catch (e) { errorToast('Import failed:', e); }
@@ -1663,6 +1832,7 @@
     if (pollBusy) return;
     pollBusy = true;
     try {
+      if (LOCAL) await (await LOCAL).sync();
       const st = await api('GET', '/api/state');
       net.failures = 0;
       setOffline(false);
@@ -1758,7 +1928,13 @@
   }
 
   function bindUnload() {
+    // A phone puts the app away without unloading it (and may end it later):
+    // save at once when it goes out of sight.
+    document.addEventListener('visibilitychange', () => {
+      if (LOCAL && document.visibilityState === 'hidden') saveEverything();
+    });
     window.addEventListener('beforeunload', (e) => {
+      if (LOCAL) return;                     // saved in place below, whatever the size
       const reqs = pendingRequests();
       if (!reqs.length) return;
       const size = reqs.reduce((n, r) => n + bodySize(r), 0);
@@ -1775,12 +1951,16 @@
       let budget = KEEPALIVE_BUDGET;
       for (const r of reqs) {
         const body = JSON.stringify(r.body);
-        const size = new Blob([body]).size;
+        const size = LOCAL ? 0 : new Blob([body]).size;
         if (size > budget) continue;
         budget -= size;
         try {
-          fetch(r.url, { method: r.method, keepalive: true, body,
-            headers: { 'Content-Type': 'application/json', 'X-Todo': '1' } });
+          // Local: apply now, in this very task (an await would come too late).
+          if (LOCAL) { if (localNow && lockHeld) localNow.api.handle(r.method, r.url, r.body); }
+          else {
+            fetch(r.url, { method: r.method, keepalive: true, body,
+              headers: { 'Content-Type': 'application/json', 'X-Todo': '1' } });
+          }
         } catch (e) { /* nothing more we can do */ }
       }
       E.pending = { id: null, fields: {} };
@@ -2817,7 +2997,7 @@
     pendingSubtaskExtra: pendingNotesRequests, clearSubtaskExtra: clearNotes, flushSubtaskExtra: flushAllNotes,
     earlierSubtaskDue, firstLine,
     // phones
-    NARROW, TOUCH, back, closeDrawer, idle,
+    NARROW, TOUCH, back, closeDrawer, idle, MODE, local: LOCAL, checkLocalReminders, saveFile,
     showPage(page) {
       S.page = page === 'matrix' && TT.matrix ? 'matrix' : 'list';
       $('#list-page').hidden = S.page !== 'list';
@@ -2859,7 +3039,13 @@
     TT.showPage(location.hash === '#matrix' ? 'matrix' : 'list');
     setInterval(pollState, 1500);
     pollState();
-    focusQuickAdd();
+    if (LOCAL) {
+      writeLock();
+      setTimeout(checkLocalReminders, 3000);
+      setInterval(checkLocalReminders, 60000);
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkLocalReminders(); });
+    }
+    if (!TOUCH.matches) focusQuickAdd();      // on a phone that would pop the keyboard up over the list
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => setTimeout(boot, 0));

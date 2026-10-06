@@ -82,9 +82,11 @@ class AppServer:
         if wait:
             self.wait_ready()
 
+    url_override = None      # tests in local mode open the page from elsewhere
+
     @property
     def url(self):
-        return f'http://127.0.0.1:{self.port}/'
+        return self.url_override or f'http://127.0.0.1:{self.port}/'
 
     def wait_ready(self, timeout=15):
         deadline = time.time() + timeout
@@ -146,3 +148,68 @@ def copy_app(dest=None, tools=False):
         shutil.copytree(os.path.join(APP_DIR, 'tools'), os.path.join(dest, 'tools'), dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns('__pycache__'))
     return dest
+
+
+class LocalPageServer:
+    """Serves web/ the way the Android app does (no API: data stays in the
+    page). Same rules as android/src/.../AssetServer.java: index.html with
+    mode "local", the API version, a build id and a fresh nonce for the CSP;
+    other files as they are; /images/ and /api/ do not exist."""
+
+    def __init__(self, app_dir=APP_DIR):
+        import http.server
+        import secrets
+        import threading
+        sys.path.insert(0, app_dir)
+        import server as server_mod
+        web = os.path.join(app_dir, 'web')
+        api = server_mod.API
+        types = server_mod.STATIC_TYPES
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                path = self.path.split('?', 1)[0]
+                headers = {}
+                if path in ('/', '/index.html'):
+                    nonce = secrets.token_urlsafe(16)
+                    with open(os.path.join(web, 'index.html'), encoding='utf-8') as f:
+                        body = (f.read().replace('__BUILD__', 'local-test').replace('__API__', str(api))
+                                .replace('__MODE__', 'local').replace('__NONCE__', nonce)).encode('utf-8')
+                    ctype = 'text/html; charset=utf-8'
+                    headers['Content-Security-Policy'] = (
+                        "default-src 'self'; " f"script-src 'self' 'nonce-{nonce}'; " "style-src 'self' 'unsafe-inline'; "
+                        "img-src 'self' data: blob: http: https:; " "connect-src 'self'; object-src 'none'; base-uri 'none'; "
+                        "form-action 'none'; frame-ancestors 'none'")
+                else:
+                    name = path.lstrip('/')
+                    fp = os.path.join(web, name)
+                    ext = os.path.splitext(name)[1]
+                    if '/' in name or '\\' in name or ext not in types or not os.path.isfile(fp):
+                        self.send_response(404)
+                        self.send_header('Content-Length', '0')
+                        self.end_headers()
+                        return
+                    with open(fp, 'rb') as f:
+                        body = f.read()
+                    ctype = types[ext]
+                self.send_response(200)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Cache-Control', 'no-store')
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.port = free_port()
+        self.httpd = http.server.ThreadingHTTPServer(('127.0.0.1', self.port), Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, kwargs={'poll_interval': 0.1}, daemon=True)
+        self.thread.start()
+        self.url = f'http://127.0.0.1:{self.port}/'
+
+    def cleanup(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()

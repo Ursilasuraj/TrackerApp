@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from cdp import Browser  # noqa: E402
-from helpers import AppServer, copy_app  # noqa: E402
+from helpers import AppServer, LocalPageServer, copy_app  # noqa: E402
 
 PNG = (b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89'
        b'\x00\x00\x00\rIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe\x02\xfe\xa7\x8b\x8a\x86\x00\x00\x00\x00IEND\xaeB`\x82')
@@ -62,7 +62,11 @@ class UICase(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------
 
+    def before_open(self):
+        """Hook: the local-mode mix-in hands the data over to the new window."""
+
     def open(self, url=None, dark=False):
+        self.before_open()
         self.page = self.browser.new_page()
         p = self.page
         p.send('Emulation.setDeviceMetricsOverride', {'width': 1200, 'height': 820, 'deviceScaleFactor': 1, 'mobile': False})
@@ -76,6 +80,12 @@ class UICase(unittest.TestCase):
 
     def task(self, title, **fields):
         return self.api('POST', '/api/tasks', dict(title=title, **fields), expect=201)
+
+    def upload_image(self, data):
+        from helpers import request
+        st, img, _ = request(self.srv.port, 'POST', '/api/images', raw=data, headers={'Content-Type': 'image/png'})
+        self.assertEqual(st, 201, img)
+        return img
 
     def server_task(self, tid):
         return self.api('GET', f'/api/tasks/{tid}')
@@ -111,6 +121,63 @@ class UICase(unittest.TestCase):
     def open_editor(self, title):
         self.page.click(self.row_sel(title))
         self.page.wait_for('!!document.querySelector("#editor:not([hidden]) .ed-title") && document.querySelector(".ed-title").value === %s' % js(title))
+
+
+class LocalMode:
+    """Mix-in: run a test class in the Android app's mode (no server; the data
+    lives in the page, on IndexedDB). What a test sets up before opening the
+    page goes through a short-lived tab of the same origin; later requests go
+    through the open page (and look like changes made on another device)."""
+
+    LOCAL = True
+
+    def setUp(self):
+        super().setUp()
+        self.local = LocalPageServer()
+        self.srv.url_override = self.local.url
+        self._setup_page = None
+
+    def tearDown(self):
+        if self._setup_page:
+            self.browser.close_page(self._setup_page)
+            self._setup_page = None
+        try:
+            super().tearDown()
+        finally:
+            self.local.cleanup()
+
+    def _runner(self):
+        if self.page is not None:
+            return self.page
+        if self._setup_page is None:
+            self._setup_page = self.browser.new_page()
+            self._setup_page.navigate(self.local.url)
+            self._setup_page.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+        return self._setup_page
+
+    def before_open(self):
+        if self._setup_page:
+            self.browser.close_page(self._setup_page)     # hands the data over to the app's window
+            self._setup_page = None
+
+    def open(self, url=None, dark=False):
+        p = super().open(url, dark)
+        self.assertEqual(p.eval('TT.MODE'), 'local')
+        return p
+
+    def api(self, method, path, body=None, expect=None):
+        res = self._runner().eval('TT.local.then(async (l) => { await l.sync(); return l.api.handle(%s, %s, %s); })'
+                                  % (js(method), js(path), js(body)))
+        if expect is not None:
+            self.assertEqual(res['status'], expect, f'{method} {path} -> {res}')
+        return res['data']
+
+    def upload_image(self, data):
+        import base64
+        res = self._runner().eval('TT.local.then((l) => l.api.handle("POST", "/api/images",'
+                                  ' Uint8Array.from(atob(%s), (c) => c.charCodeAt(0))))' % js(base64.b64encode(data).decode()))
+        self.assertEqual(res['status'], 201, res)
+        return res['data']
 
 
 class QuickAddTests(UICase):
@@ -1201,8 +1268,7 @@ class ThemeTests(UICase):
     def rich_data(self):
         today = time.strftime('%Y-%m-%d')
         labels = [f'label{i}' for i in range(15)]
-        from helpers import request
-        st, img, _ = request(self.srv.port, 'POST', '/api/images', raw=PNG, headers={'Content-Type': 'image/png'})
+        img = self.upload_image(PNG)
         self.image_url = img['url']
         a = self.task('Overdue high task', due_at='2020-02-02', priority='high', labels=labels[:5],
                       description='Snippet text here ![pic](%s)' % img['url'])
@@ -1337,7 +1403,8 @@ class ThemeTests(UICase):
             # Lightbox and banners.
             p.click('[data-k="nav:all"]')
             self.open_editor('Overdue high task')
-            p.eval('TT.$("#lightbox img").src = %s; TT.$("#lightbox").hidden = false' % js(self.image_url))
+            p.wait_for('!!document.querySelector(".md-preview img")')
+            p.eval('TT.$("#lightbox img").src = document.querySelector(".md-preview img").src; TT.$("#lightbox").hidden = false')
             failures += self.scan(f'{theme}/lightbox')
             p.eval('TT.$("#lightbox").hidden = true')
             for kind in ('', 'info'):
@@ -1355,6 +1422,7 @@ class PhoneTests(UICase):
     W, H = 390, 844
 
     def open_phone(self, dark=False):
+        self.before_open()
         self.page = self.browser.new_page()
         p = self.page
         p.send('Emulation.setDeviceMetricsOverride', {'width': self.W, 'height': self.H, 'deviceScaleFactor': 2, 'mobile': True})
@@ -1598,6 +1666,182 @@ class PhoneTests(UICase):
         self.assertEqual(failures, [], '\n'.join(failures))
 
 
+class LocalModeTests(UICase):
+    """The Android app's mode: no server, the data lives in the page
+    (localdb.js on IndexedDB). Served like the app serves its assets."""
+
+    BRIDGE = ('window.__bridge = {notify: [], schedule: [], saveFile: []};'
+              'window.TodoTrackerAndroid = {'
+              ' notify(j) { __bridge.notify.push(JSON.parse(j)); },'
+              ' schedule(j) { __bridge.schedule.push(JSON.parse(j)); },'
+              ' saveFile(name, type, text) { __bridge.saveFile.push({name, type, text}); } };')
+
+    def setUp(self):
+        super().setUp()
+        self.local = LocalPageServer()
+        self.addCleanup(self.local.cleanup)
+
+    def open_local(self, url=None, bridge=False, phone=False):
+        self.page = self.browser.new_page()
+        p = self.page
+        if phone:
+            p.send('Emulation.setDeviceMetricsOverride', {'width': 390, 'height': 844, 'deviceScaleFactor': 2, 'mobile': True})
+            p.send('Emulation.setTouchEmulationEnabled', {'enabled': True, 'maxTouchPoints': 5})
+        else:
+            p.send('Emulation.setDeviceMetricsOverride', {'width': 1200, 'height': 820, 'deviceScaleFactor': 1, 'mobile': False})
+        p.send('Emulation.setEmulatedMedia', {'features': [{'name': 'prefers-reduced-motion', 'value': 'reduce'}]})
+        if bridge:
+            p.send('Page.addScriptToEvaluateOnNewDocument', {'source': self.BRIDGE})
+        p.navigate(url or self.local.url)
+        p.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+        self.assertEqual(p.eval('TT.MODE'), 'local')
+        return p
+
+    def local_api(self, method, path, body=None, page=None):
+        res = (page or self.page).eval('TT.local.then((l) => l.api.handle(%s, %s, %s))' % (js(method), js(path), js(body)))
+        self.assertLess(res['status'], 400, res)
+        return res['data']
+
+    def test_tasks_survive_a_reload_and_show_in_another_tab(self):
+        p = self.open_local()
+        self.assertFalse(p.eval('!!document.querySelector(\'[data-k="side:backup"]\')'), 'no "Back up now" without a server')
+        self.quick_add('Water the plants #home !high ^tomorrow')
+        self.wait_rows(['Water the plants'])
+        self.quick_add('Call mum')
+        self.wait_rows(['Call mum', 'Water the plants'])
+        self.open_editor('Water the plants')
+        p.click('[data-k="ed:desc"]')
+        p.type('Balcony **first**')
+        self.wait_saved()
+        tid = p.eval('TT.E.task.id')
+        p.click('[data-k="sub:add"]')
+        p.type('Fill the can')
+        p.key('Enter')
+        p.wait_for('TT.E.task && TT.E.task.subtasks.length === 1 && TT.E.task.subtasks[0].id > 0')
+        p.key('Escape')
+        p.reload(wait=True)
+        p.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+        self.wait_rows(['Call mum', 'Water the plants'])
+        task = self.local_api('GET', f'/api/tasks/{tid}')
+        self.assertEqual((task['description'], task['priority'], [l['name'] for l in task['labels']], task['subtasks'][0]['title']),
+                         ('Balcony **first**', 'high', ['home'], 'Fill the can'))
+        # A second window shows the same tasks but leaves the changes to the
+        # first (two copies would overwrite each other's changes) ...
+        other = self.browser.new_page()
+        try:
+            other.navigate(self.local.url)
+            other.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+            other.wait_for('!document.querySelector("#banner").hidden && document.querySelector("#banner").textContent.includes("another window")', timeout=5)
+            self.quick_add('From tab one')
+            other.wait_for('Array.from(document.querySelectorAll("#list .row-title")).some(e => e.textContent === "From tab one")', timeout=6)
+            other.click('#qa')
+            other.type('From tab two')
+            other.key('Enter')
+            other.wait_for('Array.from(document.querySelectorAll(".toast")).some(t => t.textContent.includes("open in another window"))', timeout=6)
+            self.assertEqual(self.local_api('GET', '/api/tasks?view=all&q=tab+two')['tasks'], [])
+            # ... until the first one closes.
+            self.browser.close_page(p)
+            self.page = other
+            other.wait_for('document.querySelector("#banner").hidden', timeout=6)
+            other.click('#qa')
+            other.key('a', 'ctrl')
+            other.type('From tab two')
+            other.key('Enter')
+            self.wait_rows(['From tab two', 'From tab one', 'Call mum', 'Water the plants'], timeout=6)
+        except Exception:
+            self.browser.close_page(other)
+            raise
+
+    def test_pictures_are_kept_on_the_device(self):
+        self.page = None
+        p = self.open_local()
+        self.local_api('POST', '/api/tasks', {'title': 'Receipt'})
+        p.eval('TT.refresh()')
+        self.wait_rows(['Receipt'])
+        path = os.path.join(self.srv.data, 'photo.png')
+        with open(path, 'wb') as f:
+            f.write(PNG)
+        self.open_editor('Receipt')
+        p.send('Page.setInterceptFileChooserDialog', {'enabled': True})
+        p.take_events()
+        p.click('[data-k="ed:add-image"]')
+        deadline = time.time() + 5
+        chooser = None
+        while time.time() < deadline and not chooser:
+            ev = p.take_events('Page.fileChooserOpened')
+            chooser = ev[0]['params'] if ev else None
+            time.sleep(0.05)
+        self.assertIsNotNone(chooser)
+        p.send('DOM.setFileInputFiles', {'files': [path], 'backendNodeId': chooser['backendNodeId']})
+        p.wait_for('!!document.querySelector(".md-preview img") && document.querySelector(".md-preview img").src.startsWith("blob:")', timeout=8)
+        self.wait_saved()
+        p.reload(wait=True)
+        p.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+        self.open_editor('Receipt')
+        p.wait_for('(() => { const i = document.querySelector(".md-preview img");'
+                   ' return !!i && i.src.startsWith("blob:") && i.complete && i.naturalWidth === 1; })()', timeout=8)
+
+    def test_export_import_and_reminders_through_the_android_bridge(self):
+        p = self.open_local(bridge=True)
+        today = time.strftime('%Y-%m-%d')
+        # A date that has already arrived when it is set needs no reminder.
+        self.local_api('POST', '/api/tasks', {'title': 'Already due', 'due_at': '2020-01-01'})
+        self.local_api('POST', '/api/tasks', {'title': 'Set when due', 'due_at': f'{today}T00:00'})
+        self.local_api('POST', '/api/tasks', {'title': 'Later', 'due_at': '2031-05-05T08:30'})
+        self.local_api('POST', '/api/import', {'tasks': [{'title': 'Imported overdue', 'due_at': '2021-03-04T05:06',
+                                                         'created_at': '2021-01-01T00:00:00'}]})
+        p.eval('TT.checkLocalReminders()')
+        time.sleep(0.5)
+        self.assertEqual(p.eval('__bridge.notify.length'), 0)
+        # One whose time arrives while the app is open (as if set an hour ago).
+        p.eval('TT.local.then((l) => l.store.write((tx) => { const t = tx.all("tasks").find((x) => x.title === "Imported overdue");'
+               ' tx.put("tasks", Object.assign({}, t, {reminded_at: null})); }))')
+        p.eval('TT.checkLocalReminders()')
+        p.wait_for('__bridge.schedule.length > 0 && __bridge.notify.length > 0', timeout=5)
+        shown = p.eval('__bridge.notify.flat()')
+        self.assertEqual([n['title'] for n in shown], ['Imported overdue'])
+        self.assertTrue(shown[0]['key'].startswith('t'))
+        upcoming = p.eval('__bridge.schedule[__bridge.schedule.length - 1]')
+        self.assertEqual([(u['title'], u['body']) for u in upcoming], [('Later', 'Due today 08:30')])
+        import datetime as _dt
+        self.assertEqual(upcoming[0]['at'], int(_dt.datetime(2031, 5, 5, 8, 30).timestamp() * 1000))
+        p.eval('TT.checkLocalReminders()')
+        time.sleep(0.5)
+        self.assertEqual(len(p.eval('__bridge.notify.flat()')), 1, 'each reminder is shown once')
+        # Export goes to the bridge; importing it into an empty device restores everything.
+        p.click('[data-k="side:export"]')
+        p.wait_for('__bridge.saveFile.length === 1', timeout=5)
+        saved = p.eval('__bridge.saveFile[0]')
+        self.assertRegex(saved['name'], r'^todotracker-export-\d{4}-\d{2}-\d{2}\.json$')
+        data = json.loads(saved['text'])
+        self.assertEqual(sorted(t['title'] for t in data['tasks']), ['Already due', 'Imported overdue', 'Later', 'Set when due'])
+        fresh = LocalPageServer()
+        self.addCleanup(fresh.cleanup)
+        self.browser.close_page(p)
+        p = self.open_local(url=fresh.url)
+        self.assertEqual(self.local_api('GET', '/api/tasks?view=all')['tasks'], [])
+        summary = self.local_api('POST', '/api/import', data)['summary']
+        self.assertEqual((summary['tasks'], summary['skipped']), (4, 0))
+        p.eval('TT.refresh()')
+        p.wait_for('document.querySelectorAll("#list .row").length === 4', timeout=5)
+
+    def test_phone_matrix_in_local_mode(self):
+        p = self.open_local(phone=True)
+        self.assertIsNone(p.eval('document.activeElement && document.activeElement.id === "qa" ? "qa" : null'),
+                          'no keyboard popping up on start')
+        a = self.local_api('POST', '/api/tasks', {'title': 'Fix the sink', 'due_at': time.strftime('%Y-%m-%d'), 'priority': 'high'})
+        p.eval('TT.showPage("matrix")')
+        p.wait_for(f'!!document.querySelector(\'.tray-item[data-key="t{a["id"]}"]\')', timeout=8)
+        p.tap(f'.tray-item[data-key="t{a["id"]}"] .tray-title')
+        p.wait_for('!!document.querySelector(".mx-actions")')
+        p.tap('[data-k="mxa:do"]')
+        p.wait_for(f'!!document.querySelector(\'.mx-list.q-do .mx-li[data-key="t{a["id"]}"]\') && !TT.matrixBusy()')
+        p.reload(wait=True)
+        p.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+        pos = self.local_api('GET', f'/api/tasks/{a["id"]}')['matrix']
+        self.assertTrue(pos[0] >= 0.5 and pos[1] >= 0.5, pos)
+
+
 class UpdateTests(UICase):
     def server_args(self):
         self.app = copy_app()
@@ -1638,6 +1882,59 @@ class UpdateTests(UICase):
             f.write(re.sub(r'^API = \d+', f'API = {api - 1}', src, count=1, flags=re.M))
         self.new_srv = AppServer(app_dir=self.app, port=self.srv.port, data_dir=self.srv.data)
         p.wait_for('!document.querySelector("#banner").hidden && document.querySelector("#banner").textContent.includes("old version is still running")', timeout=15)
+
+
+# The same tests in the Android app's mode (data in the page, no server).
+class LocalQuickAddTests(LocalMode, QuickAddTests):
+    pass
+
+
+class LocalListTests(LocalMode, ListTests):
+    pass
+
+
+class LocalEditorTests(LocalMode, EditorTests):
+    pass
+
+
+class LocalRobustnessTests(LocalMode, RobustnessTests):
+    def test_big_pending_edit_asks_before_leaving(self):
+        # Without a server there is no size limit and nothing to wait for: a
+        # big unsaved edit is saved in place when the page goes away.
+        t = self.task('Big')
+        p = self.open()
+        self.open_editor('Big')
+        p.eval('(() => { const ta = document.querySelector("[data-k=\\"ed:desc\\"]"); ta.focus(); })()')
+        p.type('x' * 70000)
+        p.reload()
+        time.sleep(0.4)
+        self.assertEqual(p.take_events('Page.javascriptDialogOpening'), [], 'no question before leaving')
+        p.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+        self.assertEqual(len(self.server_task(t['id'])['description']), 70000)
+
+
+class LocalSubtaskTests(LocalMode, SubtaskTests):
+    pass
+
+
+class LocalSubtaskDetailTests(LocalMode, SubtaskDetailTests):
+    pass
+
+
+class LocalMatrixTests(LocalMode, MatrixTests):
+    pass
+
+
+class LocalImportTests(LocalMode, ImportTests):
+    pass
+
+
+class LocalThemeTests(LocalMode, ThemeTests):
+    pass
+
+
+class LocalPhoneTests(LocalMode, PhoneTests):
+    pass
 
 
 if __name__ == '__main__':

@@ -77,6 +77,10 @@ class TaskTests(StoreCase):
             dict(title='a', labels='home'), dict(title='a', labels=['two words']),
             dict(title='a', labels=['x' * 41]), dict(title='a', labels=['a,b']),
             dict(title='a', description='x' * 200_001),
+            # A trailing newline or other scripts' digits would be stored as is
+            # and break the date views and sorting.
+            dict(title='a', due_at='2026-10-06\n'), dict(title='a', due_at='2026-10-06T14:30\n'),
+            dict(title='a', due_at='\u0662\u0660\u0662\u0666-\u0661\u0660-\u0660\u0666'),
         ]
         for kw in bad:
             with self.subTest(kw=str(kw)[:60]):
@@ -891,6 +895,8 @@ class ServerTests(unittest.TestCase):
             ('PATCH', '/api/labels/1', {}, 400, 'Nothing'),
             ('GET', '/api/tasks?view=nope', None, 400, 'Unknown view'),
             ('GET', '/api/tasks?labels=1,x', None, 400, 'Invalid labels'),
+            ('GET', '/api/tasks?labels=%C2%B2', None, 400, 'Invalid labels'),     # "²" passes isdigit()
+            ('PATCH', '/api/labels/1', {'color': '#aabbcc\n'}, 400, 'Colour'),
             ('GET', '/api/nothing', None, 404, 'Not found'),
             ('PUT', '/api/tasks', {'title': 'x'}, 405, 'not allowed'),
         ]

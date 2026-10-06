@@ -37,11 +37,13 @@ MAX_SUBTASKS_PER_REQUEST = 500
 MAX_NOTES = 20_000
 REMIND_DATE_ONLY_AT = '09:00'
 
-DATE_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})$')
-DATETIME_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$')
-COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
-KEY_RE = re.compile(r'^([ts])([1-9]\d{0,11})$')
-STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$')
+# Whole-string matches with ASCII digits only ("$" would also accept a
+# trailing newline, and \d other scripts' digits).
+DATE_RE = re.compile(r'([0-9]{4})-([0-9]{2})-([0-9]{2})')
+DATETIME_RE = re.compile(r'([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2})')
+COLOR_RE = re.compile(r'#[0-9a-fA-F]{6}')
+KEY_RE = re.compile(r'([ts])([1-9][0-9]{0,11})')
+STAMP_RE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')
 IMG_RE = re.compile(r'!\[[^\]\n]*\]\(\s*(?:/images/[^\s)]+|https?://[^\s)]+)[^)\n]*\)')
 
 
@@ -202,10 +204,10 @@ def clean_due(value):
         return None
     if not isinstance(value, str):
         raise ValidationError('Target date must be a string like 2026-10-01 or 2026-10-01T14:30.')
-    m = DATE_RE.match(value)
+    m = DATE_RE.fullmatch(value)
     if m and _valid_ymd(*m.groups()):
         return value
-    m = DATETIME_RE.match(value)
+    m = DATETIME_RE.fullmatch(value)
     if m and _valid_ymd(*m.groups()[:3]) and int(m.group(4)) < 24 and int(m.group(5)) < 60:
         return value
     raise ValidationError(f'Invalid target date "{value[:40]}". Use YYYY-MM-DD or YYYY-MM-DDTHH:MM.')
@@ -232,7 +234,7 @@ def clean_description(value):
 
 def clean_stamp(value, what='Timestamp'):
     """A local timestamp YYYY-MM-DDTHH:MM:SS (used when restoring/importing)."""
-    if not isinstance(value, str) or not STAMP_RE.match(value):
+    if not isinstance(value, str) or not STAMP_RE.fullmatch(value):
         raise ValidationError(f'{what} must look like 2026-10-06T14:30:00.')
     try:
         datetime.fromisoformat(value)
@@ -260,7 +262,7 @@ def first_line(text, limit=120):
 
 def parse_key(key):
     """'t12' -> ('t', 12) for a task, 's34' -> ('s', 34) for a subtask."""
-    m = KEY_RE.match(key) if isinstance(key, str) else None
+    m = KEY_RE.fullmatch(key) if isinstance(key, str) else None
     if not m:
         raise ValidationError(f'Invalid item key {str(key)[:20]!r} (use t<id> or s<id>).')
     return m.group(1), int(m.group(2))
@@ -311,7 +313,7 @@ def clean_label_name(value):
 
 
 def clean_color(value):
-    if not isinstance(value, str) or not COLOR_RE.match(value):
+    if not isinstance(value, str) or not COLOR_RE.fullmatch(value):
         raise ValidationError('Colour must look like #1a2b3c.')
     return value.lower()
 
@@ -421,7 +423,7 @@ def _import_stamp(value):
     if not isinstance(value, str):
         return None
     v = value.strip().replace(' ', 'T', 1)
-    m = re.match(r'^(\d{4}-\d{2}-\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?)?', v)
+    m = re.match(r'([0-9]{4}-[0-9]{2}-[0-9]{2})(?:T([0-9]{2}):([0-9]{2})(?::([0-9]{2}))?)?', v)
     if not m:
         return None
     try:
@@ -1543,17 +1545,26 @@ class Store:
         stamp = now_iso(now)
         moment = "CASE WHEN length(due_at) = 10 THEN due_at || 'T{}' ELSE due_at END".format(
             REMIND_DATE_ONLY_AT)
+        # Most minutes nothing is due: look first, so the check does not count
+        # as a change (open pages would reload for it).
+        with self.read() as c:
+            if not self._due_task_reminders(c, current, moment) and not self._due_subtask_reminders(c, current):
+                return []
         items = []
         with self.write() as c:
-            for r in c.execute(
-                    f"SELECT id, title, due_at FROM tasks WHERE status != 'done' AND due_at IS NOT NULL "
-                    f"AND reminded_at IS NULL AND {moment} <= ? ORDER BY {moment}, id", (current,)):
-                items.append({'kind': 'task', 'id': r['id'], 'title': r['title'], 'due_at': r['due_at']})
+            items.extend(self._due_task_reminders(c, current, moment))
             items.extend(self._due_subtask_reminders(c, current))
             for it in items:
                 table = 'tasks' if it['kind'] == 'task' else 'subtasks'
                 c.execute(f'UPDATE {table} SET reminded_at = ? WHERE id = ?', (stamp, it['id']))
         return items
+
+    @staticmethod
+    def _due_task_reminders(c, current, moment):
+        return [{'kind': 'task', 'id': r['id'], 'title': r['title'], 'due_at': r['due_at']}
+                for r in c.execute(
+                    f"SELECT id, title, due_at FROM tasks WHERE status != 'done' AND due_at IS NOT NULL "
+                    f"AND reminded_at IS NULL AND {moment} <= ? ORDER BY {moment}, id", (current,))]
 
     def _due_subtask_reminders(self, c, current):
         moment = "CASE WHEN length(s.due_at) = 10 THEN s.due_at || 'T{}' ELSE s.due_at END".format(REMIND_DATE_ONLY_AT)
@@ -1583,7 +1594,7 @@ class Store:
                 if isinstance(l, dict) and isinstance(l.get('name'), str):
                     name = _import_label_name(l['name'])
                     color = l.get('color')
-                    if name and isinstance(color, str) and COLOR_RE.match(color):
+                    if name and isinstance(color, str) and COLOR_RE.fullmatch(color):
                         colors[name.lower()] = color.lower()
             label_ids = {}
 

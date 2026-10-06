@@ -153,7 +153,7 @@ def parse_id_list(text, what='labels'):
         part = part.strip()
         if not part:
             continue
-        if not part.isdigit() or len(part) > 12:
+        if not (part.isascii() and part.isdigit()) or len(part) > 12:
             raise ApiError(400, f'Invalid {what} list.')
         out.append(int(part))
     return out
@@ -181,22 +181,22 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'/api/state', 'api_state'),
         ('GET', r'/api/meta', 'api_meta'),
         ('GET', r'/api/tasks', 'api_list_tasks'),
-        ('GET', r'/api/tasks/(\d+)', 'api_get_task'),
+        ('GET', r'/api/tasks/([0-9]+)', 'api_get_task'),
         ('GET', r'/api/export', 'api_export'),
         ('GET', r'/api/deps', 'api_list_deps'),
         ('POST', r'/api/deps', 'api_add_dep'),
-        ('DELETE', r'/api/deps/(\d+)', 'api_delete_dep'),
+        ('DELETE', r'/api/deps/([0-9]+)', 'api_delete_dep'),
         ('POST', r'/api/matrix', 'api_matrix'),
         ('POST', r'/api/import', 'api_import'),
         ('POST', r'/api/tasks', 'api_create_task'),
-        ('POST', r'/api/tasks/(\d+)/subtasks', 'api_add_subtasks'),
-        ('POST', r'/api/tasks/(\d+)/subtasks/order', 'api_order_subtasks'),
-        ('PATCH', r'/api/subtasks/(\d+)', 'api_update_subtask'),
-        ('DELETE', r'/api/subtasks/(\d+)', 'api_delete_subtask'),
-        ('PATCH', r'/api/tasks/(\d+)', 'api_update_task'),
-        ('DELETE', r'/api/tasks/(\d+)', 'api_delete_task'),
-        ('PATCH', r'/api/labels/(\d+)', 'api_update_label'),
-        ('DELETE', r'/api/labels/(\d+)', 'api_delete_label'),
+        ('POST', r'/api/tasks/([0-9]+)/subtasks', 'api_add_subtasks'),
+        ('POST', r'/api/tasks/([0-9]+)/subtasks/order', 'api_order_subtasks'),
+        ('PATCH', r'/api/subtasks/([0-9]+)', 'api_update_subtask'),
+        ('DELETE', r'/api/subtasks/([0-9]+)', 'api_delete_subtask'),
+        ('PATCH', r'/api/tasks/([0-9]+)', 'api_update_task'),
+        ('DELETE', r'/api/tasks/([0-9]+)', 'api_delete_task'),
+        ('PATCH', r'/api/labels/([0-9]+)', 'api_update_label'),
+        ('DELETE', r'/api/labels/([0-9]+)', 'api_delete_label'),
         ('POST', r'/api/images', 'api_upload_image'),
         ('POST', r'/api/backup', 'api_backup'),
         ('POST', r'/api/shutdown', 'api_shutdown'),
@@ -280,7 +280,7 @@ class Handler(BaseHTTPRequestHandler):
             if m != method:
                 allowed = True
                 continue
-            args = [int(g) if g.isdigit() else g for g in match.groups()]
+            args = [int(g) if g.isascii() and g.isdigit() else g for g in match.groups()]
             getattr(self, handler)(*args, query=query)
             return
         if allowed:
@@ -379,6 +379,7 @@ class Handler(BaseHTTPRequestHandler):
         nonce = secrets.token_urlsafe(16)
         html = (html.replace('__BUILD__', self.app.build)
                     .replace('__API__', str(API))
+                    .replace('__MODE__', 'server')
                     .replace('__NONCE__', nonce))
         csp = ("default-src 'self'; "
                f"script-src 'self' 'nonce-{nonce}'; "
