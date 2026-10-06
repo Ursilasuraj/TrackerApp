@@ -16,8 +16,8 @@
   const MD = window.TTMarkdown;
   const ROOT = document.documentElement;
   const BOOT = { api: Number(ROOT.dataset.api) || 0, build: ROOT.dataset.build || '' };
-  const CLIENT_API = 1;            // the server API this page is written for
-  const FEATURE_API = {};          // feature -> minimum server API
+  const CLIENT_API = 2;            // the server API this page is written for
+  const FEATURE_API = { subtasks: 2 };   // feature -> minimum server API
   const KEEPALIVE_BUDGET = 60000;  // Chromium allows 64 KB of keepalive bodies in flight
   const STATUS_NAMES = { open: 'Open', in_progress: 'In progress', done: 'Done' };
   const PRIORITY_NAMES = { high: 'High', medium: 'Medium', low: 'Low' };
@@ -302,6 +302,7 @@
     loaded: false,
     openId: null,
     editingLabel: null,
+    unfolded: new Set(),
     flashId: null,
   };
   if (!VIEW_NAMES[S.view]) S.view = 'open';
@@ -865,9 +866,10 @@
     return '<div class="' + cls + '" data-id="' + t.id + '" role="listitem">'
       + '<button type="button" class="check" data-act="check" data-k="' + k + ':check" aria-pressed="' + done + '"'
       + ' aria-label="' + (done ? 'Reopen' : 'Mark done') + ': ' + esc(t.title) + '" title="' + (done ? 'Reopen' : 'Mark done') + '"></button>'
-      + '<div class="row-main" data-act="open" data-k="' + k + ':open" tabindex="0" role="button"'
+      + '<div class="row-main" data-act="open">'
+      + '<button type="button" class="row-title" data-act="open" data-k="' + k + ':open"'
       + ' aria-label="' + esc(t.title) + (t.status === 'in_progress' ? ', in progress' : '') + (t.due_at ? ', due ' + esc(P.dueLong(t.due_at)) : '') + '">'
-      + '<div class="row-title">' + esc(t.title) + '</div>'
+      + esc(t.title) + '</button>'
       + (t.snippet ? '<div class="row-snippet">' + esc(t.snippet) + '</div>' : '')
       + '<div class="row-meta">' + badges.join('') + labels + stamp + '</div>'
       + '</div>' + prio
@@ -899,7 +901,7 @@
     const rows = $$('.row', list);
     const idx = Math.min(snap.rowIndex == null ? 0 : snap.rowIndex, rows.length - 1);
     if (idx >= 0) {
-      const target = rows[idx].querySelector('[data-k$=":' + part + '"]') || rows[idx].querySelector('.row-main');
+      const target = rows[idx].querySelector('[data-k$=":' + part + '"]') || rows[idx].querySelector('.row-title');
       if (target) return target;
     }
     return list;
@@ -971,13 +973,11 @@
         openEditor(id);
       } else if (TT.listAction) TT.listAction(act, el, id, e);
     });
+    list.addEventListener('change', (e) => { if (TT.listChange) TT.listChange(e); });
     list.addEventListener('keydown', (e) => {
       const el = e.target;
       if (TT.listKeydown && TT.listKeydown(e)) return;
-      if (el.dataset.act === 'open' && (e.key === 'Enter' || e.key === ' ')) {
-        e.preventDefault();
-        openEditor(Number(el.closest('.row').dataset.id));
-      } else if ((el.dataset.act === 'open' || el.dataset.act === 'check') && (e.key === 'ArrowDown' || e.key === 'ArrowUp')
+      if ((el.dataset.act === 'open' || el.dataset.act === 'check') && (e.key === 'ArrowDown' || e.key === 'ArrowUp')
         && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
         e.preventDefault();
         const rows = $$('.row', list);
@@ -1000,7 +1000,7 @@
   const E = {
     task: null,
     pending: { id: null, fields: {} },   // unsaved fields and the task they belong to
-    inflight: null,                       // {id, fields} of the save on the wire
+    sending: [],                          // [{id, fields}] saves queued or on the wire, oldest first
     timer: 0,
     chain: Promise.resolve(),
     saving: 0,
@@ -1011,7 +1011,7 @@
 
   function editorValues(t) {
     const v = Object.assign({}, t);
-    if (E.inflight && E.inflight.id === t.id) Object.assign(v, E.inflight.fields);
+    for (const rec of E.sending) if (rec.id === t.id) Object.assign(v, rec.fields);
     if (E.pending.id === t.id) Object.assign(v, E.pending.fields);
     if (v.labels && v.labels.length && typeof v.labels[0] === 'string') {
       v.labels = v.labels.map((name) => labelByName(name) || (t.labels.find((l) => l.name.toLowerCase() === name.toLowerCase()))
@@ -1208,10 +1208,11 @@
     const fields = E.pending.fields;
     if (id === null || !Object.keys(fields).length) return E.chain;
     E.pending = { id: null, fields: {} };
+    const rec = { id, fields };
+    E.sending.push(rec);    // recorded now, so redraws keep showing these values
     E.saving++;
     updateSaveState();
     E.chain = E.chain.then(async () => {
-      E.inflight = { id, fields };
       try {
         const task = await api('PATCH', '/api/tasks/' + id, fields);
         applyTask(task);
@@ -1222,7 +1223,7 @@
         if (e.status === 404 && S.openId === id) closeEditor({ keepFocus: true });
         else if (S.openId === id) reloadEditor();
       } finally {
-        E.inflight = null;
+        E.sending.splice(E.sending.indexOf(rec), 1);
         E.saving--;
         updateSaveState();
       }
@@ -1627,18 +1628,15 @@
   /** Edits that have not reached the server yet. */
   function pendingRequests() {
     const reqs = [];
-    const fields = {};
-    let id = null;
-    if (E.inflight) { id = E.inflight.id; Object.assign(fields, E.inflight.fields); }
-    if (E.pending.id !== null && Object.keys(E.pending.fields).length) {
-      if (id !== null && id !== E.pending.id) {
-        reqs.push({ method: 'PATCH', url: '/api/tasks/' + id, body: Object.assign({}, fields) });
-        for (const key of Object.keys(fields)) delete fields[key];
-      }
-      id = E.pending.id;
-      Object.assign(fields, E.pending.fields);
+    // Saves already queued may not finish once the page goes away; PATCH is
+    // idempotent, so they are sent again (merged per task, in order).
+    const records = E.sending.slice();
+    if (E.pending.id !== null && Object.keys(E.pending.fields).length) records.push(E.pending);
+    for (const rec of records) {
+      const last = reqs[reqs.length - 1];
+      if (last && last.url === '/api/tasks/' + rec.id) Object.assign(last.body, rec.fields);
+      else reqs.push({ method: 'PATCH', url: '/api/tasks/' + rec.id, body: Object.assign({}, rec.fields) });
     }
-    if (id !== null && Object.keys(fields).length) reqs.push({ method: 'PATCH', url: '/api/tasks/' + id, body: fields });
     if (TT.pendingSubtaskRequests) reqs.push(...TT.pendingSubtaskRequests());
     return reqs;
   }
@@ -1714,6 +1712,696 @@
     $('#menu-btn').setAttribute('aria-expanded', String(open));
   }
 
+  // ------------------------------------------------------------- subtasks
+
+  // All subtask writes go through one serialized queue. Changes show at once
+  // (optimistically) in the list and the editor; server answers are drawn
+  // only when no further subtask write is queued, and refreshes keep the
+  // local subtasks of tasks with writes pending. New subtasks get a negative
+  // temporary id until the server's id is known.
+  const Q = {
+    chain: Promise.resolve(),
+    pending: 0,
+    byTask: new Map(),
+    real: new Map(),
+    nextTemp: -1,
+    failed: false,
+    entries: [],          // queued requests (for sending them when the window closes)
+    drafts: new Map(),    // subtask id -> {taskId, title} typed but not saved yet
+  };
+  let allDoneToast = null;
+
+  function realId(id) { return id < 0 ? (Q.real.get(id) || null) : id; }
+
+  function nowStamp() {
+    const d = new Date();
+    return P.ymd(d) + 'T' + P.pad(d.getHours()) + ':' + P.pad(d.getMinutes()) + ':' + P.pad(d.getSeconds());
+  }
+
+  /** Every local copy of a task (list, editor, matrix). */
+  function taskCopies(taskId) {
+    const out = [];
+    const t = taskById(taskId);
+    if (t) out.push(t);
+    if (E.task && E.task.id === taskId && !out.includes(E.task)) out.push(E.task);
+    if (TT.matrixCopies) for (const m of TT.matrixCopies(taskId)) if (!out.includes(m)) out.push(m);
+    return out;
+  }
+
+  function currentTask(taskId) {
+    return (E.task && E.task.id === taskId ? E.task : null) || taskById(taskId)
+      || (TT.matrixCopies ? TT.matrixCopies(taskId)[0] : null) || null;
+  }
+
+  function recount(t) {
+    t.progress = [t.subtasks.filter((s) => s.done).length, t.subtasks.length];
+  }
+
+  function mutate(taskId, fn) {
+    for (const t of taskCopies(taskId)) {
+      t.subtasks = t.subtasks || [];
+      fn(t);
+      t.subtasks.forEach((s, i) => { s.position = i; });
+      recount(t);
+    }
+  }
+
+  function findSub(taskId, sid) {
+    const t = currentTask(taskId);
+    return t ? (t.subtasks || []).find((s) => s.id === sid) || null : null;
+  }
+
+  function renderSubtaskViews(taskId) {
+    renderList();
+    if (E.task && E.task.id === taskId) renderEditor();
+    if (TT.matrix) TT.matrix.render();
+  }
+
+  function subtaskBusy() { return Q.pending > 0; }
+
+  function enqueue(taskId, build, opts) {
+    opts = opts || {};
+    const entry = { build, sent: false, kind: opts.kind || 'write' };
+    Q.entries.push(entry);
+    Q.pending++;
+    Q.byTask.set(taskId, (Q.byTask.get(taskId) || 0) + 1);
+    updateSaveState();
+    Q.chain = Q.chain.then(async () => {
+      entry.sent = true;
+      let req = null;
+      try { req = build(); } catch (e) { req = null; }
+      try {
+        if (req) {
+          const task = await api(req.method, req.url, req.body);
+          if (opts.onSaved) opts.onSaved(task);
+          // Draw the server's answer only if no other subtask write follows.
+          if (Q.pending === 1) applyServerTask(task);
+        }
+      } catch (e) {
+        Q.failed = true;
+        errorToast('Could not save the subtask change:', e);
+        if (opts.onFailed) opts.onFailed(e);
+      } finally {
+        Q.entries.splice(Q.entries.indexOf(entry), 1);
+        Q.pending--;
+        const n = (Q.byTask.get(taskId) || 1) - 1;
+        if (n) Q.byTask.set(taskId, n); else Q.byTask.delete(taskId);
+        updateSaveState();
+        if (Q.pending === 0) {
+          if (Q.failed) {
+            Q.failed = false;
+            refresh();
+            reloadEditor();
+          } else scheduleRefresh(300);
+        }
+      }
+    });
+    return Q.chain;
+  }
+
+  function applyServerTask(task) {
+    applyTask(task);
+    if (TT.matrix) TT.matrix.applyTask(task);
+    renderSubtaskViews(task.id);
+  }
+
+  function mapTemps(taskId, temps, ids) {
+    temps.forEach((temp, i) => {
+      const real = ids[i];
+      if (!real) return;
+      Q.real.set(temp, real);
+      for (const t of taskCopies(taskId)) {
+        for (const s of t.subtasks || []) if (s.id === temp) s.id = real;
+      }
+      if (Q.drafts.has(temp)) { Q.drafts.set(real, Q.drafts.get(temp)); Q.drafts.delete(temp); }
+      // Rename the live elements, so focus and typed text follow the subtask.
+      for (const el of $$('[data-k^="s' + temp + ':"], [data-k^="ls' + temp + ':"]')) {
+        el.dataset.k = el.dataset.k.replace(/^(l?s)-\d+:/, '$1' + real + ':');
+      }
+      for (const el of $$('[data-sid="' + temp + '"]')) el.dataset.sid = String(real);
+    });
+  }
+
+  function subtaskItem(it) {
+    const out = { title: it.title };
+    for (const key of ['done', 'position', 'created_at', 'completed_at']) {
+      if (it[key] !== undefined && it[key] !== null) out[key] = it[key];
+    }
+    if (TT.subtaskItemExtra) TT.subtaskItemExtra(it, out);
+    return out;
+  }
+
+  function addSubtasks(taskId, items, opts) {
+    opts = opts || {};
+    const temps = items.map(() => Q.nextTemp--);
+    const stamp = nowStamp();
+    mutate(taskId, (t) => {
+      items.forEach((it, i) => {
+        const sub = Object.assign({ task_id: taskId, done: false, created_at: stamp, completed_at: null }, it, { id: temps[i] });
+        if (sub.done && !sub.completed_at) sub.completed_at = stamp;
+        if (it.position != null && it.position < t.subtasks.length) t.subtasks.splice(it.position, 0, sub);
+        else t.subtasks.push(sub);
+      });
+    });
+    renderSubtaskViews(taskId);
+    return enqueue(taskId, () => ({
+      method: 'POST', url: '/api/tasks/' + taskId + '/subtasks', body: { items: items.map(subtaskItem) },
+    }), {
+      kind: 'add',
+      onSaved: (task) => {
+        mapTemps(taskId, temps, task.created_ids || []);
+        if (opts.onSaved) opts.onSaved(task);
+      },
+      onFailed: (e) => { if (opts.onFailed) opts.onFailed(e); },
+    });
+  }
+
+  function updateSubtask(taskId, sid, fields) {
+    const stamp = nowStamp();
+    mutate(taskId, (t) => {
+      const s = t.subtasks.find((x) => x.id === sid);
+      if (!s) return;
+      if ('done' in fields && fields.done !== s.done) s.completed_at = fields.done ? stamp : null;
+      Object.assign(s, TT.localSubtaskFields ? TT.localSubtaskFields(fields) : fields);
+    });
+    renderSubtaskViews(taskId);
+    return enqueue(taskId, () => {
+      const id = realId(sid);
+      return id ? { method: 'PATCH', url: '/api/subtasks/' + id, body: fields } : null;
+    });
+  }
+
+  function removeSubtask(taskId, sid, opts) {
+    opts = opts || {};
+    let removed = null;
+    let index = -1;
+    mutate(taskId, (t) => {
+      const i = t.subtasks.findIndex((x) => x.id === sid);
+      if (i < 0) return;
+      if (!removed || t === E.task) { removed = Object.assign({}, t.subtasks[i]); index = i; }
+      t.subtasks.splice(i, 1);
+    });
+    if (!removed) return;
+    Q.drafts.delete(sid);
+    if (allDoneToast && allDoneToast.taskId === taskId) checkAllDone(taskId, false);
+    renderSubtaskViews(taskId);
+    enqueue(taskId, () => {
+      const id = realId(sid);
+      return id ? { method: 'DELETE', url: '/api/subtasks/' + id } : null;
+    });
+    if (opts.undo !== false) {
+      toast('Removed subtask “' + removed.title + '”.', {
+        action: 'Undo',
+        onAction: () => {
+          const item = Object.assign({}, removed, { position: index });
+          delete item.id;
+          addSubtasks(taskId, [item]);
+        },
+      });
+    }
+  }
+
+  function reorderSubtasks(taskId, ids) {
+    mutate(taskId, (t) => {
+      const byId = new Map(t.subtasks.map((s) => [s.id, s]));
+      const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
+      for (const s of t.subtasks) if (!ordered.includes(s)) ordered.push(s);
+      t.subtasks = ordered;
+    });
+    renderSubtaskViews(taskId);
+    return enqueue(taskId, () => ({
+      method: 'POST', url: '/api/tasks/' + taskId + '/subtasks/order',
+      body: { ids: ids.map(realId).filter(Boolean) },
+    }));
+  }
+
+  function setSubtaskDone(taskId, sid, done) {
+    updateSubtask(taskId, sid, { done });
+    checkAllDone(taskId, done);
+  }
+
+  /** After the last subtask is ticked, offer to complete the task. */
+  function checkAllDone(taskId, ticked) {
+    const t = currentTask(taskId);
+    const subs = t ? t.subtasks || [] : [];
+    const all = subs.length > 0 && subs.every((s) => s.done);
+    const showing = allDoneToast && allDoneToast.taskId === taskId && allDoneToast.toast.el.isConnected;
+    if (all && ticked && t.status !== 'done' && !showing) {
+      if (allDoneToast) allDoneToast.toast.dismiss();
+      const handle = toast('All subtasks of “' + t.title + '” are done.', {
+        action: 'Mark task done',
+        timeout: 12000,
+        onAction: () => {
+          allDoneToast = null;
+          const cur = currentTask(taskId);
+          const subsNow = cur ? cur.subtasks || [] : [];
+          if (cur && cur.status !== 'done' && subsNow.length && subsNow.every((s) => s.done)) {
+            setTaskStatus(taskId, 'done', { undo: true });
+          }
+        },
+      });
+      allDoneToast = { taskId, toast: handle };
+    } else if (!all && showing) {
+      allDoneToast.toast.dismiss();
+      allDoneToast = null;
+    }
+  }
+
+  // -- subtasks in the list
+
+  function rowExtraBadges(t) {
+    const [done, total] = t.progress || [0, 0];
+    if (!total || !supports('subtasks')) return '';
+    const open = S.unfolded.has(t.id);
+    const pct = Math.round((done / total) * 100);
+    return '<button type="button" class="badge sub-badge" data-act="unfold" data-k="t' + t.id + ':unfold" aria-expanded="' + open + '"'
+      + ' aria-label="Subtasks ' + done + ' of ' + total + ' done; ' + (open ? 'hide' : 'show') + ' them"'
+      + ' title="' + (open ? 'Hide' : 'Show') + ' subtasks">'
+      + '<span class="mini-bar" aria-hidden="true"><span style="width:' + pct + '%"></span></span>'
+      + done + '/' + total + '<span aria-hidden="true">' + (open ? '▲' : '▼') + '</span></button>';
+  }
+
+  function miniSubHTML(t, s, now) {
+    const k = 'ls' + s.id;
+    return '<li class="mini-sub' + (s.done ? ' done' : '') + '" data-sid="' + s.id + '">'
+      + '<input type="checkbox" id="mini-' + s.id + '" data-act="mini-check" data-sid="' + s.id + '" data-k="' + k + ':check"' + (s.done ? ' checked' : '') + '>'
+      + '<label for="mini-' + s.id + '">' + esc(s.title) + '</label>'
+      + (TT.subtaskMetaHTML ? TT.subtaskMetaHTML(t, s, now, 'list') : '')
+      + '</li>';
+  }
+
+  function rowExtra(t, now) {
+    const subs = t.subtasks || [];
+    if (!subs.length || !supports('subtasks')) return '';
+    let shown;
+    if (S.unfolded.has(t.id)) shown = subs;
+    else if (t.match_subs && t.match_subs.length) shown = subs.filter((s) => t.match_subs.includes(s.id));
+    else return '';
+    if (!shown.length) return '';
+    return '<ul class="row-subs" aria-label="Subtasks of ' + esc(t.title) + '">'
+      + shown.map((s) => miniSubHTML(t, s, now)).join('') + '</ul>';
+  }
+
+  function listAction(act, el, id) {
+    if (act === 'unfold') {
+      if (S.unfolded.has(id)) S.unfolded.delete(id); else S.unfolded.add(id);
+      renderList();
+    } else if (TT.listActionExtra) TT.listActionExtra(act, el, id);
+  }
+
+  function listChange(e) {
+    const el = e.target;
+    if (el.dataset.act !== 'mini-check') return;
+    const taskId = Number(el.closest('.row').dataset.id);
+    setSubtaskDone(taskId, Number(el.dataset.sid), el.checked);
+  }
+
+  function listKeydown(e) {
+    const el = e.target;
+    if (el.dataset.act === 'mini-check' && e.key === 'Enter') {
+      e.preventDefault();
+      el.click();
+      return true;
+    }
+    return false;
+  }
+
+  // -- subtasks in the editor
+
+  function editorSubtasksHTML(t) {
+    if (!supports('subtasks')) return '';
+    const subs = t.subtasks || [];
+    const [done, total] = t.progress || [0, 0];
+    const now = new Date();
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    return '<section class="ed-subtasks" aria-labelledby="ed-subs-title">'
+      + '<div class="ed-section-title"><span id="ed-subs-title">Subtasks</span>'
+      + (total ? '<span class="sub-count">' + done + ' of ' + total + ' done</span>' : '') + '</div>'
+      + (total ? '<div class="progress" role="progressbar" aria-label="Subtasks done" aria-valuemin="0" aria-valuemax="' + total
+        + '" aria-valuenow="' + done + '"><span style="width:' + pct + '%"></span></div>' : '')
+      + '<ul class="subtasks" data-task="' + t.id + '">' + subs.map((s) => subtaskRowHTML(t, s, now)).join('') + '</ul>'
+      + '<input type="text" class="sub-add" data-k="sub:add" maxlength="500" autocomplete="off"'
+      + ' placeholder="Add a subtask (paste several lines to add several)" aria-label="Add a subtask">'
+      + '</section>';
+  }
+
+  function subtaskRowHTML(t, s, now) {
+    const k = 's' + s.id;
+    return '<li class="sub' + (s.done ? ' done' : '') + '" data-sid="' + s.id + '">'
+      + '<div class="sub-line">'
+      + '<span class="grip" data-act="sub-grip" title="Drag to reorder (or Alt+↑/↓)" aria-hidden="true">⋮⋮</span>'
+      + '<input type="checkbox" class="sub-check" data-act="sub-check" data-k="' + k + ':check"' + (s.done ? ' checked' : '')
+      + ' aria-label="Done: ' + esc(s.title) + '">'
+      + '<input type="text" class="sub-title" data-k="' + k + ':title" value="' + esc(s.title) + '" maxlength="500"'
+      + ' autocomplete="off" aria-label="Subtask title">'
+      + (TT.subtaskButtonsHTML ? TT.subtaskButtonsHTML(t, s) : '')
+      + '<button type="button" class="icon-btn sub-del" data-act="sub-del" data-k="' + k + ':del"'
+      + ' aria-label="Remove subtask ' + esc(s.title) + '" title="Remove (Undo is offered)">✕</button>'
+      + '</div>'
+      + (TT.subtaskMetaHTML ? TT.subtaskMetaHTML(t, s, now, 'editor') : '')
+      + (TT.subtaskDetailsHTML ? TT.subtaskDetailsHTML(t, s) : '')
+      + '</li>';
+  }
+
+  function subIdFromKey(k) {
+    const m = /^s(-?\d+):/.exec(k || '');
+    return m ? Number(m[1]) : null;
+  }
+
+  function titleInputs() { return $$('#editor .sub-title'); }
+
+  function focusTitle(el, atEnd) {
+    if (!el) return;
+    el.focus({ preventScroll: false });
+    if (atEnd !== false) {
+      const n = el.value.length;
+      try { el.setSelectionRange(n, n); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function commitTitle(el) {
+    if (!E.task) return;
+    const sid = subIdFromKey(el.dataset.k);
+    const s = findSub(E.task.id, sid);
+    if (!s) return;
+    Q.drafts.delete(sid);
+    const parsed = TT.parseSubtaskInput ? TT.parseSubtaskInput(el.value, E.task) : { title: el.value.replace(/\s+/g, ' ').trim() };
+    if (!parsed.title) {
+      el.value = s.title;
+      return;
+    }
+    const fields = {};
+    if (parsed.title !== s.title) fields.title = parsed.title;
+    if (TT.subtaskTokenFields) Object.assign(fields, TT.subtaskTokenFields(parsed, s));
+    if (parsed.title !== el.value) el.value = parsed.title;
+    el.defaultValue = parsed.title;
+    if (Object.keys(fields).length) updateSubtask(E.task.id, sid, fields);
+  }
+
+  function addFromBox(text) {
+    const t = E.task;
+    if (!t) return;
+    const parsed = TT.parseSubtaskInput ? TT.parseSubtaskInput(text, t) : { title: text.replace(/\s+/g, ' ').trim() };
+    if (!parsed.title) return;
+    const item = { title: parsed.title };
+    if (TT.subtaskTokenFields) Object.assign(item, TT.subtaskTokenFields(parsed, null));
+    addSubtasks(t.id, [item]);
+  }
+
+  function moveSubtask(sid, delta) {
+    const t = E.task;
+    const ids = t.subtasks.map((s) => s.id);
+    const i = ids.indexOf(sid);
+    const j = i + delta;
+    if (i < 0 || j < 0 || j >= ids.length) return;
+    ids.splice(i, 1);
+    ids.splice(j, 0, sid);
+    reorderSubtasks(t.id, ids);
+  }
+
+  function editorKeydown(e) {
+    const el = e.target;
+    const k = el.dataset.k || '';
+    const plain = !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey;
+    if (k === 'sub:add') {
+      if (e.key === 'Enter' && !e.isComposing && !e.altKey) {
+        e.preventDefault();
+        if (el.value.trim()) {
+          addFromBox(el.value);
+          el.value = '';
+          el.defaultValue = '';
+        }
+      } else if (e.key === 'Escape' && el.value) {
+        // First Esc clears the draft; the next one closes the panel.
+        e.preventDefault();
+        e.stopPropagation();
+        el.value = '';
+      } else if (e.key === 'ArrowUp' && plain) {
+        const titles = titleInputs();
+        if (titles.length) { e.preventDefault(); focusTitle(titles[titles.length - 1]); }
+      }
+      return;
+    }
+    const sid = subIdFromKey(k);
+    if (sid === null || !E.task) return;
+    if (k.endsWith(':title')) {
+      const titles = titleInputs();
+      const i = titles.indexOf(el);
+      if (e.key === 'Enter' && plain && !e.isComposing) {
+        e.preventDefault();
+        commitTitle(el);
+        const next = titleInputs()[i + 1];
+        if (next) focusTitle(next); else $(kq('sub:add')).focus();
+      } else if (e.key === 'Enter' && e.altKey && TT.openSubtaskDetails) {
+        e.preventDefault();
+        commitTitle(el);
+        TT.openSubtaskDetails(sid);
+      } else if (e.key === 'Escape') {
+        const s = findSub(E.task.id, sid);
+        if (s && el.value !== s.title) {
+          e.preventDefault();
+          e.stopPropagation();
+          el.value = s.title;
+          el.defaultValue = s.title;
+          Q.drafts.delete(sid);
+        }
+      } else if (e.key === 'Backspace' && plain && !el.value && !e.repeat) {
+        // Deleting with Backspace on an empty title, but never on key repeat
+        // (holding Backspace must not eat the subtasks above).
+        e.preventDefault();
+        const prev = titles[i - 1];
+        const next = titles[i + 1];
+        removeSubtask(E.task.id, sid);
+        const target = prev ? $(kq(prev.dataset.k)) : next ? $(kq(next.dataset.k)) : $(kq('sub:add'));
+        focusTitle(target);
+      } else if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && plain) {
+        e.preventDefault();
+        const target = e.key === 'ArrowUp' ? titles[i - 1] : (titles[i + 1] || $(kq('sub:add')));
+        if (target) focusTitle(target);
+      } else if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        e.preventDefault();
+        commitTitle(el);
+        moveSubtask(sid, e.key === 'ArrowUp' ? -1 : 1);
+      }
+      return;
+    }
+    if (k.endsWith(':check') && e.key === 'Enter') {
+      e.preventDefault();
+      el.click();
+    } else if (TT.subtaskKeydownExtra) TT.subtaskKeydownExtra(e, sid);
+  }
+
+  function editorAction(act, el, e) {
+    const li = el.closest('li.sub');
+    const sid = li ? Number(li.dataset.sid) : null;
+    if (act === 'sub-del' && sid !== null) {
+      const titles = titleInputs();
+      const i = titles.findIndex((x) => subIdFromKey(x.dataset.k) === sid);
+      removeSubtask(E.task.id, sid);
+      const left = titleInputs();
+      const target = left[Math.min(i, left.length - 1)];
+      if (target) focusTitle(target); else $(kq('sub:add')).focus({ preventScroll: true });
+    } else if (TT.subtaskActionExtra) TT.subtaskActionExtra(act, el, sid, e);
+  }
+
+  function editorChange(e) {
+    const el = e.target;
+    if (el.dataset.act === 'sub-check') {
+      setSubtaskDone(E.task.id, subIdFromKey(el.dataset.k), el.checked);
+    } else if (TT.subtaskChangeExtra) TT.subtaskChangeExtra(e);
+  }
+
+  function editorInput(e) {
+    const el = e.target;
+    const k = el.dataset.k || '';
+    if (k.endsWith(':title') && k.startsWith('s')) {
+      Q.drafts.set(subIdFromKey(k), { taskId: E.task.id, title: el.value });
+    } else if (TT.subtaskInputExtra) TT.subtaskInputExtra(e);
+  }
+
+  function editorFocusout(e) {
+    const el = e.target;
+    const k = el.dataset.k || '';
+    if (k.startsWith('s') && k.endsWith(':title') && el.isConnected) commitTitle(el);
+    else if (TT.subtaskFocusoutExtra) TT.subtaskFocusoutExtra(e);
+  }
+
+  function editorPaste(e) {
+    const el = e.target;
+    if (el.dataset.k !== 'sub:add' || !E.task) return;
+    const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+    if (!/[\r\n\u2028\u2029]/.test(text)) return;
+    const before = el.value.slice(0, el.selectionStart);
+    const after = el.value.slice(el.selectionEnd);
+    const items = P.splitPastedLines(before + text + after);
+    if (items.length < 2) return;
+    e.preventDefault();
+    const t = E.task;
+    addSubtasks(t.id, items.map((it) => {
+      const parsed = TT.parseSubtaskInput ? TT.parseSubtaskInput(it.title, t) : { title: it.title };
+      const item = { title: parsed.title || it.title, done: it.done };
+      if (TT.subtaskTokenFields) Object.assign(item, TT.subtaskTokenFields(parsed, null));
+      return item;
+    }));
+    el.value = '';
+  }
+
+  function startSubtaskDrag(e, grip) {
+    if (e.button !== 0) return;
+    const li = grip.closest('li.sub');
+    const ul = li.parentNode;
+    const taskId = Number(ul.dataset.task);
+    const start = Array.from(ul.children).map((x) => Number(x.dataset.sid));
+    e.preventDefault();
+    beginDrag();
+    li.classList.add('dragging');
+    ul.classList.add('reordering');
+    // Capture on the list: moving the row would detach the grip and drop the capture.
+    try { ul.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    const onMove = (ev) => {
+      let before = null;
+      for (const sib of Array.from(ul.children)) {
+        if (sib === li) continue;
+        const r = sib.getBoundingClientRect();
+        if (ev.clientY < r.top + r.height / 2) { before = sib; break; }
+      }
+      if (before !== li.nextSibling && before !== li) ul.insertBefore(li, before);
+    };
+    let finished = false;
+    const finish = (commit) => {
+      if (finished) return;
+      finished = true;
+      window.removeEventListener('pointermove', onMove, true);
+      window.removeEventListener('pointerup', onUp, true);
+      window.removeEventListener('pointercancel', onCancel, true);
+      window.removeEventListener('blur', onCancel);
+      document.removeEventListener('keydown', onKey, true);
+      try { ul.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      li.classList.remove('dragging');
+      ul.classList.remove('reordering');
+      const order = Array.from(ul.children).map((x) => Number(x.dataset.sid));
+      endDrag();
+      if (commit && order.join() !== start.join()) reorderSubtasks(taskId, order);
+      else renderEditor();
+    };
+    const onUp = () => finish(true);
+    const onCancel = () => finish(false);
+    const onKey = (ev) => {
+      if (ev.key !== 'Escape') return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      for (const id of start) {
+        const node = ul.querySelector('[data-sid="' + id + '"]');
+        if (node) ul.appendChild(node);
+      }
+      finish(false);
+    };
+    window.addEventListener('pointermove', onMove, true);
+    window.addEventListener('pointerup', onUp, true);
+    window.addEventListener('pointercancel', onCancel, true);
+    window.addEventListener('blur', onCancel);
+    document.addEventListener('keydown', onKey, true);
+  }
+
+  function bindSubtasks() {
+    const panel = $('#editor');
+    panel.addEventListener('pointerdown', (e) => {
+      const grip = e.target.closest('.grip');
+      if (grip && panel.contains(grip)) startSubtaskDrag(e, grip);
+    });
+    panel.addEventListener('paste', editorPaste);
+  }
+
+  // -- checklist conversion
+
+  async function convertChecklist() {
+    const t = E.task;
+    if (!t) return;
+    const ta = $(kq('ed:desc'));
+    const desc = ta ? ta.value : (t.description || '');
+    const items = MD.findChecklist(desc);
+    if (!items.length) return;
+    flushFields();
+    // Create the subtasks first; remove exactly those lines only after that worked.
+    addSubtasks(t.id, items.map((i) => ({ title: i.title, done: i.done })), {
+      onSaved: async () => {
+        let base;
+        if (E.task && E.task.id === t.id) {
+          const cur = $(kq('ed:desc'));
+          base = cur ? cur.value : editorValues(E.task).description;
+        } else {
+          try { base = (await api('GET', '/api/tasks/' + t.id)).description; } catch (e) { return; }
+        }
+        const next = MD.removeLines(base, items);
+        if (next !== base) {
+          queueField(t.id, 'description', next, 0);
+          if (E.task && E.task.id === t.id) {
+            const cur = $(kq('ed:desc'));
+            if (cur) { cur.value = next; cur.defaultValue = next; }
+            renderEditor();
+          }
+        }
+        toast('Turned ' + items.length + (items.length === 1 ? ' checklist line' : ' checklist lines') + ' into subtasks.');
+      },
+      onFailed: () => toast('The checklist was left in the description.', { kind: 'error' }),
+    });
+  }
+
+  // -- keeping local state, leaving the page
+
+  function mergeLocalSubtasks(tasks) {
+    for (const t of tasks) {
+      if (!Q.byTask.has(t.id)) continue;
+      const local = currentTask(t.id);
+      if (local && local.subtasks) {
+        t.subtasks = local.subtasks;
+        recount(t);
+      }
+    }
+    return tasks;
+  }
+
+  function mergeEditorLocal(task) {
+    if (Q.byTask.has(task.id) && E.task && E.task.id === task.id && E.task.subtasks) {
+      task.subtasks = E.task.subtasks;
+      recount(task);
+    }
+    return task;
+  }
+
+  function pendingSubtaskRequests() {
+    const reqs = [];
+    for (const entry of Q.entries) {
+      if (entry.sent && entry.kind === 'add') continue;   // a second add would duplicate
+      let req = null;
+      try { req = entry.build(); } catch (e) { req = null; }
+      if (req) reqs.push({ method: req.method, url: req.url, body: req.body || {} });
+    }
+    for (const [sid, draft] of Q.drafts) {
+      const s = findSub(draft.taskId, sid);
+      const title = draft.title.replace(/\s+/g, ' ').trim();
+      const id = realId(sid);
+      if (id && s && title && title !== s.title) reqs.push({ method: 'PATCH', url: '/api/subtasks/' + id, body: { title } });
+    }
+    if (TT.pendingSubtaskExtra) reqs.push(...TT.pendingSubtaskExtra());
+    return reqs;
+  }
+
+  function clearPendingSubtasks() {
+    for (const entry of Q.entries) entry.sent = true;
+    Q.entries.length = 0;
+    Q.drafts.clear();
+    if (TT.clearSubtaskExtra) TT.clearSubtaskExtra();
+  }
+
+  function flushSubtasks() {
+    const el = document.activeElement;
+    if (el && el.dataset && /^s-?\d+:title$/.test(el.dataset.k || '')) commitTitle(el);
+    if (TT.flushSubtaskExtra) TT.flushSubtaskExtra();
+  }
+
+  function beforeEditorSwitch() { flushSubtasks(); }
+
   // ------------------------------------------------------------- boot
 
   const TT = {
@@ -1723,6 +2411,13 @@
     refresh, scheduleRefresh, applyTask, renderList, renderSidebar, renderEditor, openEditor,
     closeEditor, reloadEditor, queueField, flushFields, updateSaveState, setTaskStatus, chipHTML,
     dueBadgeHTML, updateHeader, focusQuickAdd, insertAtCaret, on, emit, load, save, editorValues,
+    // subtasks
+    Q, realId, taskCopies, currentTask, mutate, findSub, addSubtasks, updateSubtask, removeSubtask,
+    reorderSubtasks, setSubtaskDone, renderSubtaskViews, subtaskBusy, nowStamp,
+    rowExtraBadges, rowExtra, listAction, listChange, listKeydown, editorSubtasksHTML, editorKeydown,
+    editorAction, editorChange, editorInput, editorFocusout, convertChecklist, beforeEditorSwitch,
+    mergeLocal: mergeLocalSubtasks, mergeEditorLocal, pendingSubtaskRequests, clearPendingSubtasks,
+    flushSubtasks, subtaskChain: () => Q.chain,
     showPage(page) {
       S.page = page === 'matrix' && TT.matrix ? 'matrix' : 'list';
       $('#list-page').hidden = S.page !== 'list';
@@ -1748,6 +2443,7 @@
     bindList();
     bindEditor();
     bindLightbox();
+    bindSubtasks();
     bindGlobalKeys();
     bindUnload();
     $('#sort').value = S.sort;

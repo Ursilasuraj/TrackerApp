@@ -67,6 +67,7 @@ they are due today.
 | Esc | app | close the details panel, or clear the search |
 | ↑ / ↓ | list | move between tasks |
 | Enter / Space | list | open the task / tick it (Undo in the toast) |
+| Enter, Esc, ↑/↓, Alt+↑/↓, Backspace | subtask title | save + next, revert, move, reorder, delete if empty |
 
 ### Views, labels, search
 
@@ -90,6 +91,32 @@ optional time (✕ = no date), labels, and a Markdown description with a live
 preview. Paste (Ctrl+V) or drop images into the description; they are stored
 in `data\images` and clicking one in the preview enlarges it. Everything
 saves by itself (text after a 600 ms pause; selects and dates at once).
+
+### Subtasks
+
+Any task can have subtasks (details panel → *Add a subtask*):
+
+- **Enter** adds one; **pasting several lines adds one subtask per line**. A
+  list marker or checkbox (`-`, `*`, `1.`, `- [ ]`, `- [x]`) is removed only
+  when a space follows, so `3.5 kg flour` and `-v flag` stay as they are;
+  empty bullets and `---` / `* * *` rules are skipped; `[x]` lines arrive
+  ticked. **Esc** clears the draft; a second Esc closes the panel.
+- Titles are edited in place: **Enter** saves and moves on, **Esc** reverts,
+  **Backspace** in an empty title deletes it (holding Backspace does not
+  delete more), **↑/↓** move between titles, **Alt+↑/↓** or the ⋮⋮ grip
+  reorder (Esc during a drag cancels it), ✕ removes with **Undo** (same
+  position and timestamps).
+- "2 of 5 done" with a bar. Ticking the last one offers *Mark task done*;
+  nothing is completed automatically, and the offer disappears if a subtask
+  is unticked again.
+- In the list a task with subtasks shows a progress badge (bar, "2/5", ▼);
+  click it to unfold the subtasks and tick them there (mouse, or Tab +
+  Space/Enter). While searching, folded tasks show just the matching
+  subtasks.
+- If a description contains checklist lines (`- [ ]`, `- [x]`, `1. [ ]`,
+  outside code blocks), *Turn N checklist lines into subtasks* creates them
+  and then removes exactly those lines; the rest of the description is left
+  untouched.
 
 ### Reminders
 
@@ -164,6 +191,12 @@ These rules were bugs in an earlier version and are built in:
   swallow the click); redraws keep focus, typed text, the caret and the
   scroll position; a focused text field is kept as the same node, so undo
   history and IME input survive autosaves.
+- Subtask writes go through one serialized queue. Changes show immediately;
+  the server's answer is drawn only when no further subtask write is queued,
+  and refreshes keep the local subtasks while writes are pending. New
+  subtasks carry a temporary id until the server's id arrives.
+- When subtasks are appended, the write lock is taken (an `UPDATE`) before
+  `max(position)` is read, so concurrent adds never share a position.
 - Field saves are chained and remember which task they belong to. Closing or
   reloading the window sends pending edits with `fetch(…, {keepalive: true})`
   (within Chromium's 64 KB budget; bigger edits are saved normally and the
@@ -200,6 +233,10 @@ GET    /api/tasks/{id}
 POST   /api/tasks                  {title, description?, status?, priority?, due_at?, labels?}
 PATCH  /api/tasks/{id}             any of the above
 DELETE /api/tasks/{id}
+POST   /api/tasks/{id}/subtasks        {title} or {items: [title | {title, done?, position?, created_at?, completed_at?}]}
+POST   /api/tasks/{id}/subtasks/order  {ids: [...]}
+PATCH  /api/subtasks/{id}              {title?, done?}
+DELETE /api/subtasks/{id}              (every subtask write answers with the whole parent task)
 PATCH  /api/labels/{id}            {name?, color?}   (renaming onto an existing name merges)
 DELETE /api/labels/{id}
 POST   /api/images                 raw image body (PNG, JPEG, GIF, WebP, BMP; ≤ 25 MB)

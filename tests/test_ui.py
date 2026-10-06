@@ -78,7 +78,7 @@ class UICase(unittest.TestCase):
     def titles(self):
         return self.page.eval('Array.from(document.querySelectorAll("#list .row-title")).map(e => e.textContent)')
 
-    def row_sel(self, title, part='.row-main'):
+    def row_sel(self, title, part='.row-title'):
         idx = self.page.eval('Array.from(document.querySelectorAll("#list .row")).findIndex(r => '
                              'r.querySelector(".row-title").textContent === %s)' % js(title))
         self.assertGreaterEqual(idx, 0, f'row {title!r} not found in {self.titles()}')
@@ -474,6 +474,241 @@ class RobustnessTests(UICase):
         while time.time() < deadline and len(self.server_task(t['id'])['description']) != 70000:
             time.sleep(0.1)
         self.assertEqual(len(self.server_task(t['id'])['description']), 70000)
+
+
+class SubtaskTests(UICase):
+    def subs(self):
+        return self.page.eval('TT.E.task ? TT.E.task.subtasks.map(s => s.title + (s.done ? " ✓" : "")) : null')
+
+    def server_subs(self, tid):
+        return [s['title'] + (' ✓' if s['done'] else '') for s in self.server_task(tid)['subtasks']]
+
+    def wait_idle(self):
+        self.page.wait_for('TT.Q.pending === 0 && TT.net.inflight === 0', timeout=8)
+
+    def test_add_by_enter_and_paste_many_lines(self):
+        t = self.task('Party')
+        p = self.open()
+        self.open_editor('Party')
+        p.click('[data-k="sub:add"]')
+        p.type('Cake')
+        p.key('Enter')
+        p.type('Music')
+        p.key('Enter')
+        self.assertEqual(p.active(), 'sub:add')
+        p.paste('- milk\r\n- [x] eggs\n\n---\n3.5 kg flour\n-v flag\u2028* * *\n1. last', self.srv.url)
+        self.wait_idle()
+        want = ['Cake', 'Music', 'milk', 'eggs ✓', '3.5 kg flour', '-v flag', 'last']
+        self.assertEqual(self.subs(), want)
+        self.assertEqual(self.server_subs(t['id']), want)
+        self.assertEqual(p.eval('document.querySelector("[data-k=\\"sub:add\\"]").value'), '')
+        p.wait_for('document.querySelector(".sub-count").textContent === "1 of 7 done"')
+        # Esc clears the draft first, and closes the panel only on the second Esc.
+        p.type('draft')
+        p.key('Escape')
+        self.assertEqual(p.eval('document.querySelector("[data-k=\\"sub:add\\"]").value'), '')
+        self.assertFalse(p.eval('document.querySelector("#editor").hidden'))
+        p.key('Escape')
+        p.wait_for('document.querySelector("#editor").hidden')
+
+    def test_title_editing_keys(self):
+        t = self.task('T')
+        self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['one', 'two', 'three']}, expect=201)
+        p = self.open()
+        self.open_editor('T')
+        first = p.eval('document.querySelector(".sub-title").dataset.k')
+        p.click(f'[data-k="{first}"]')
+        p.key('End')
+        p.type(' edited')
+        p.key('Enter')                      # saves and moves on
+        self.assertTrue(p.active().endswith(':title'))
+        self.assertNotEqual(p.active(), first)
+        p.type(' changed')
+        p.key('Escape')                     # reverts
+        self.assertEqual(p.eval('document.activeElement.value'), 'two')
+        p.key('ArrowDown')
+        self.assertEqual(p.eval('document.activeElement.value'), 'three')
+        p.key('ArrowUp')
+        p.key('ArrowUp')
+        self.assertEqual(p.eval('document.activeElement.value'), 'one edited')
+        self.wait_idle()
+        self.assertEqual(self.server_subs(t['id']), ['one edited', 'two', 'three'])
+        # Backspace on an empty title deletes it, but not on key repeat.
+        p.key('ArrowDown')
+        p.key('a', 'ctrl')
+        p.key('Backspace')
+        self.assertEqual(p.eval('document.activeElement.value'), '')
+        p.key('Backspace', repeat=True)
+        self.assertEqual(self.subs(), ['one edited', 'two', 'three'])
+        p.key('Backspace')
+        self.wait_idle()
+        self.assertEqual(self.server_subs(t['id']), ['one edited', 'three'])
+        self.assertEqual(p.eval('document.activeElement.value'), 'one edited', 'focus moved to the previous title')
+
+    def test_remove_with_undo_restores_position_and_times(self):
+        t = self.task('T')
+        task = self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['a', {'title': 'b', 'done': True}, 'c']}, expect=201)
+        before = task['subtasks'][1]
+        p = self.open()
+        self.open_editor('T')
+        p.click('.sub:nth-of-type(2) .sub-del')
+        self.wait_idle()
+        self.assertEqual(self.server_subs(t['id']), ['a', 'c'])
+        p.click('.toast button:not(.toast-close)')
+        self.wait_idle()
+        after = self.server_task(t['id'])['subtasks']
+        self.assertEqual([s['title'] for s in after], ['a', 'b', 'c'])
+        self.assertEqual((after[1]['created_at'], after[1]['completed_at'], after[1]['done']),
+                         (before['created_at'], before['completed_at'], True))
+
+    def test_reorder_by_drag_alt_arrows_and_cancel(self):
+        t = self.task('T')
+        self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['a', 'b', 'c', 'd']}, expect=201)
+        p = self.open()
+        self.open_editor('T')
+        # Drag the grip of "a" below "c".
+        x0, y0 = p.center('.sub:nth-of-type(1) .grip')
+        r = p.rect('.sub:nth-of-type(3)')
+        p.drag(x0, y0, x0, r['y'] + r['h'] * 0.8, steps=10)
+        self.wait_idle()
+        self.assertEqual(self.server_subs(t['id']), ['b', 'c', 'a', 'd'])
+        # Esc during a drag cancels it.
+        x0, y0 = p.center('.sub:nth-of-type(1) .grip')
+        r = p.rect('.sub:nth-of-type(4)')
+        p.move(x0, y0)
+        p.mouse('mousePressed', x0, y0, buttons=1)
+        for i in range(1, 8):
+            p.mouse('mouseMoved', x0, y0 + (r['y'] + r['h'] - y0) * i / 7, buttons=1)
+            time.sleep(0.02)
+        self.assertEqual(p.eval('Array.from(document.querySelectorAll(".sub-title")).map(e => e.value).join()'), 'c,a,d,b')
+        p.key('Escape')
+        p.mouse('mouseReleased', x0, r['y'] + r['h'])
+        time.sleep(0.3)
+        self.assertEqual(p.eval('Array.from(document.querySelectorAll(".sub-title")).map(e => e.value).join()'), 'b,c,a,d')
+        self.assertFalse(p.eval('document.querySelector("#editor").hidden'), 'Esc only cancelled the drag')
+        # Alt+Up/Down keeps focus on the moved subtask.
+        p.click('.sub:nth-of-type(4) .sub-title')
+        p.key('ArrowUp', 'alt')
+        p.key('ArrowUp', 'alt')
+        self.assertEqual(p.eval('document.activeElement.value'), 'd')
+        self.wait_idle()
+        self.assertEqual(self.server_subs(t['id']), ['b', 'd', 'c', 'a'])
+
+    def test_last_tick_offers_mark_done_and_untick_withdraws(self):
+        t = self.task('T')
+        self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['a', 'b']}, expect=201)
+        p = self.open()
+        self.open_editor('T')
+        p.click('.sub:nth-of-type(1) .sub-check')
+        p.click('.sub:nth-of-type(2) .sub-check')
+        p.wait_for('Array.from(document.querySelectorAll(".toast")).some(t => t.textContent.includes("Mark task done"))')
+        p.click('.sub:nth-of-type(2) .sub-check')
+        p.wait_for('!Array.from(document.querySelectorAll(".toast")).some(t => t.textContent.includes("Mark task done"))')
+        p.click('.sub:nth-of-type(2) .sub-check')
+        p.wait_for('Array.from(document.querySelectorAll(".toast")).some(t => t.textContent.includes("Mark task done"))')
+        self.wait_idle()
+        self.assertEqual(self.server_task(t['id'])['status'], 'open', 'nothing is completed automatically')
+        p.eval('Array.from(document.querySelectorAll(".toast button")).find(b => b.textContent === "Mark task done").scrollIntoView()')
+        x, y = p.eval('(() => { const b = Array.from(document.querySelectorAll(".toast button")).find(b => b.textContent === "Mark task done");'
+                      ' const r = b.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()')
+        p.click_at(x, y)
+        p.wait_for('TT.E.task && TT.E.task.status === "done"')
+        self.assertEqual(self.server_task(t['id'])['status'], 'done')
+
+    def test_list_unfold_and_tick_with_keyboard(self):
+        t = self.task('Folded')
+        self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['first', 'second']}, expect=201)
+        p = self.open()
+        self.assertIn('0/2', p.eval('document.querySelector(".sub-badge").textContent'))
+        self.assertEqual(p.eval('document.querySelectorAll(".row-subs").length'), 0)
+        p.click('.sub-badge')
+        p.wait_for('document.querySelectorAll(".mini-sub").length === 2')
+        p.eval('document.querySelector(".sub-badge").focus()')
+        p.key('Tab')
+        self.assertTrue(p.active().endswith(':check') and p.active().startswith('ls'))
+        p.key(' ')
+        self.wait_idle()
+        self.assertEqual(self.server_subs(t['id']), ['first ✓', 'second'])
+        p.key('Tab')
+        p.key('Enter')
+        self.wait_idle()
+        self.assertEqual(self.server_subs(t['id']), ['first ✓', 'second ✓'])
+        self.assertTrue(p.active().startswith('ls'), 'focus stays on the subtask after the redraw')
+        p.wait_for('document.querySelector(".sub-badge").textContent.includes("2/2")')
+
+    def test_search_shows_matching_subtasks_of_folded_tasks(self):
+        t = self.task('Party')
+        self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['Buy balloons', 'Music']}, expect=201)
+        p = self.open()
+        p.click('#search')
+        p.type('ballo')
+        p.wait_for('document.querySelectorAll(".mini-sub").length === 1')
+        self.assertEqual(p.eval('document.querySelector(".mini-sub label").textContent'), 'Buy balloons')
+
+    def test_convert_checklist(self):
+        desc = 'Intro\n\n- [ ] **cake**\n    1. [x] invite `a_b`\n```\n- [ ] not this\n```\n  indented keeps\n\n\nend'
+        t = self.task('Party', description=desc)
+        p = self.open()
+        self.open_editor('Party')
+        p.wait_for('!!document.querySelector("[data-k=\\"ed:convert\\"]")')
+        self.assertIn('2 checklist lines', p.eval('document.querySelector("[data-k=\\"ed:convert\\"]").textContent'))
+        p.click('[data-k="ed:convert"]')
+        p.wait_for('Array.from(document.querySelectorAll(".toast")).some(t => t.textContent.includes("into subtasks"))', timeout=8)
+        self.wait_idle()
+        self.wait_saved()
+        st = self.server_task(t['id'])
+        self.assertEqual([s['title'] + (' ✓' if s['done'] else '') for s in st['subtasks']], ['cake', 'invite `a_b` ✓'])
+        self.assertEqual(st['description'], 'Intro\n\n```\n- [ ] not this\n```\n  indented keeps\n\n\nend')
+        self.assertFalse(p.eval('!!document.querySelector("[data-k=\\"ed:convert\\"]")'))
+
+    def test_many_fast_writes_stay_consistent(self):
+        t = self.task('Fast')
+        p = self.open()
+        self.open_editor('Fast')
+        p.click('[data-k="sub:add"]')
+        for i in range(6):
+            p.type(f'item {i}')
+            p.key('Enter')
+        # Tick the new (maybe still temporary) subtasks right away.
+        for i in (1, 3, 5):
+            p.click(f'.sub:nth-of-type({i + 1}) .sub-check', hold=0.03)
+        p.click('.sub:nth-of-type(1) .sub-del', hold=0.03)
+        self.wait_idle()
+        want = ['item 1 ✓', 'item 2', 'item 3 ✓', 'item 4', 'item 5 ✓']
+        self.assertEqual(self.server_subs(t['id']), want)
+        p.wait_for('JSON.stringify(TT.E.task.subtasks.map(s => s.title + (s.done ? " ✓" : ""))) === %s' % js(json.dumps(want, ensure_ascii=False, separators=(',', ':'))))
+        self.assertTrue(p.eval('TT.E.task.subtasks.every(s => s.id > 0)'))
+
+    def test_click_right_after_editing_a_subtask_title(self):
+        t = self.task('T')
+        self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['a', 'b']}, expect=201)
+        p = self.open()
+        self.open_editor('T')
+        p.click('.sub:nth-of-type(1) .sub-title')
+        p.key('End')
+        p.type(' renamed')
+        x, y = p.center('.sub:nth-of-type(2) .sub-check')
+        p.move(x, y)
+        p.mouse('mousePressed', x, y, buttons=1)
+        time.sleep(0.5)
+        p.mouse('mouseReleased', x, y)
+        self.wait_idle()
+        self.assertEqual(self.server_subs(t['id']), ['a renamed', 'b ✓'])
+
+    def test_unsaved_subtask_title_survives_closing(self):
+        t = self.task('T')
+        self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['draft']}, expect=201)
+        p = self.open()
+        self.open_editor('T')
+        p.click('.sub-title')
+        p.key('End')
+        p.type(' kept')
+        self.browser.close_page(p)
+        self.page = None
+        deadline = time.time() + 5
+        while time.time() < deadline and self.server_subs(t['id']) != ['draft kept']:
+            time.sleep(0.1)
+        self.assertEqual(self.server_subs(t['id']), ['draft kept'])
 
 
 class UpdateTests(UICase):

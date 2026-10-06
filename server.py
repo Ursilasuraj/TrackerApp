@@ -23,7 +23,7 @@ import db as dbmod
 APP_NAME = 'TodoTracker'
 # Bump when the API or the schema changes. The page compares it with the
 # version it was written for (CLIENT_API in web/app.js).
-API = 1
+API = 2
 
 MAX_JSON = 4 * 1024 * 1024
 MAX_IMAGE = 25 * 1024 * 1024
@@ -156,6 +156,8 @@ def parse_id_list(text, what='labels'):
     return out
 
 
+SUBTASK_FIELDS = {'title': str, 'done': bool}
+
 TASK_FIELDS = {
     'title': str, 'description': str, 'status': str, 'priority': str,
     'due_at': (str, type(None)), 'labels': list,
@@ -179,6 +181,10 @@ class Handler(BaseHTTPRequestHandler):
         ('GET', r'/api/tasks/(\d+)', 'api_get_task'),
         ('GET', r'/api/export', 'api_export'),
         ('POST', r'/api/tasks', 'api_create_task'),
+        ('POST', r'/api/tasks/(\d+)/subtasks', 'api_add_subtasks'),
+        ('POST', r'/api/tasks/(\d+)/subtasks/order', 'api_order_subtasks'),
+        ('PATCH', r'/api/subtasks/(\d+)', 'api_update_subtask'),
+        ('DELETE', r'/api/subtasks/(\d+)', 'api_delete_subtask'),
         ('PATCH', r'/api/tasks/(\d+)', 'api_update_task'),
         ('DELETE', r'/api/tasks/(\d+)', 'api_delete_task'),
         ('PATCH', r'/api/labels/(\d+)', 'api_update_label'),
@@ -437,6 +443,31 @@ class Handler(BaseHTTPRequestHandler):
         self._json_body()
         self.app.store.delete_task(task_id)
         self._send_json(200, {'ok': True})
+
+    # -- API: subtasks (every write answers with the whole parent task) ----
+
+    def api_add_subtasks(self, task_id, query):
+        body = check_fields(self._json_body(), {'title': str, 'items': list})
+        if ('title' in body) == ('items' in body):
+            raise ApiError(400, 'Send either "title" or "items".')
+        items = [body['title']] if 'title' in body else body['items']
+        task, ids = self.app.store.add_subtasks(task_id, items)
+        task['created_ids'] = ids
+        self._send_json(201, task)
+
+    def api_order_subtasks(self, task_id, query):
+        body = check_fields(self._json_body(), {'ids': list}, required=('ids',))
+        self._send_json(200, self.app.store.reorder_subtasks(task_id, body['ids']))
+
+    def api_update_subtask(self, sub_id, query):
+        body = check_fields(self._json_body(), SUBTASK_FIELDS)
+        if not body:
+            raise ApiError(400, 'Nothing to change.')
+        self._send_json(200, self.app.store.update_subtask(sub_id, body))
+
+    def api_delete_subtask(self, sub_id, query):
+        self._json_body()
+        self._send_json(200, self.app.store.delete_subtask(sub_id))
 
     # -- API: labels -------------------------------------------------------
 

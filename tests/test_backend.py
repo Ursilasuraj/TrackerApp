@@ -322,6 +322,99 @@ class ExportBackupTests(StoreCase):
         c.close()
 
 
+class SubtaskTests(StoreCase):
+    def test_add_update_delete_and_positions(self):
+        s = self.store
+        t = s.create_task('Party')
+        t, ids = s.add_subtasks(t['id'], ['cake', {'title': 'music', 'done': True}, 'balloons'])
+        self.assertEqual([(x['title'], x['position'], x['done']) for x in t['subtasks']],
+                         [('cake', 0, False), ('music', 1, True), ('balloons', 2, False)])
+        self.assertEqual(t['progress'], [1, 3])
+        self.assertEqual(t['subtasks'][1]['completed_at'], '2026-10-06T15:00:00')
+        t = s.update_subtask(ids[0], {'done': True, 'title': '  big   cake '})
+        self.assertEqual((t['subtasks'][0]['title'], t['subtasks'][0]['done']), ('big cake', True))
+        t = s.update_subtask(ids[0], {'done': False})
+        self.assertIsNone(t['subtasks'][0]['completed_at'])
+        t = s.delete_subtask(ids[1])
+        self.assertEqual([(x['title'], x['position']) for x in t['subtasks']], [('big cake', 0), ('balloons', 1)])
+        with self.assertRaises(db.NotFound):
+            s.delete_subtask(ids[1])
+        with self.assertRaises(db.NotFound):
+            s.add_subtasks(999, ['x'])
+
+    def test_restore_at_position_with_timestamps(self):
+        t = self.store.create_task('T')
+        t, ids = self.store.add_subtasks(t['id'], ['a', 'b', 'c'])
+        t, new = self.store.add_subtasks(t['id'], [{'title': 'restored', 'position': 1, 'done': True,
+                                                     'created_at': '2025-05-05T05:05:05',
+                                                     'completed_at': '2025-06-06T06:06:06'}])
+        sub = t['subtasks'][1]
+        self.assertEqual((sub['title'], sub['created_at'], sub['completed_at']),
+                         ('restored', '2025-05-05T05:05:05', '2025-06-06T06:06:06'))
+        self.assertEqual([x['title'] for x in t['subtasks']], ['a', 'restored', 'b', 'c'])
+
+    def test_validation(self):
+        t = self.store.create_task('T')
+        bad = [[], [''], ['x' * 501], [5], [{'title': 'a', 'done': 'yes'}], [{'title': 'a', 'position': -1}],
+               [{'title': 'a', 'created_at': '2026-10-06'}], [{'title': 'a', 'bogus': 1}],
+               ['x'] * (db.MAX_SUBTASKS_PER_REQUEST + 1)]
+        for items in bad:
+            with self.subTest(items=str(items)[:50]):
+                with self.assertRaises(db.ValidationError):
+                    self.store.add_subtasks(t['id'], items)
+        t, ids = self.store.add_subtasks(t['id'], ['ok'])
+        for fields in ({'title': ''}, {'done': 1}, {'title': None}):
+            with self.assertRaises(db.ValidationError):
+                self.store.update_subtask(ids[0], fields)
+
+    def test_reorder(self):
+        t = self.store.create_task('T')
+        t, ids = self.store.add_subtasks(t['id'], ['a', 'b', 'c', 'd'])
+        t = self.store.reorder_subtasks(t['id'], [ids[3], ids[1]])
+        self.assertEqual([x['title'] for x in t['subtasks']], ['d', 'b', 'a', 'c'])
+        other = self.store.create_task('U')
+        other, oids = self.store.add_subtasks(other['id'], ['z'])
+        for bad in ([oids[0]], [ids[0], ids[0]], ['x'], 'nope'):
+            with self.assertRaises(db.ValidationError):
+                self.store.reorder_subtasks(t['id'], bad)
+
+    def test_concurrent_adds_get_distinct_positions(self):
+        t = self.store.create_task('T')
+        errors = []
+
+        def worker(n):
+            try:
+                store = db.Store(self.path)
+                for i in range(10):
+                    store.add_subtasks(t['id'], [f'{n}-{i}'])
+                store.close()
+            except Exception as e:   # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(errors, [])
+        subs = self.store.get_task(t['id'])['subtasks']
+        self.assertEqual(sorted(x['position'] for x in subs), list(range(40)))
+
+    def test_search_and_cascade_and_export(self):
+        t = self.store.create_task('Party')
+        self.store.add_subtasks(t['id'], ['Buy balloons', 'Music'])
+        self.assertEqual(self.titles(q='ballo'), ['Party'])
+        hit = self.store.list_tasks(q='party ball')[0]
+        self.assertEqual([x['title'] for x in hit['subtasks'] if x['id'] in hit['match_subs']], ['Buy balloons'])
+        self.reopen(no_fts=True)
+        self.assertEqual(self.titles(q='music'), ['Party'])
+        data = self.store.export()
+        self.assertEqual([x['title'] for x in data['tasks'][0]['subtasks']], ['Buy balloons', 'Music'])
+        self.store.delete_task(t['id'])
+        with self.store.read() as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM subtasks').fetchone()[0], 0)
+
+
 OLD_SCHEMA = """
 CREATE TABLE tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
@@ -366,6 +459,7 @@ class MigrationTests(unittest.TestCase):
                 cols = {r[1] for r in c.execute('PRAGMA table_info(tasks)')}
                 for col in ('reminded_at',):
                     self.assertIn(col, cols)
+                self.assertTrue(c.execute("SELECT 1 FROM sqlite_master WHERE name = 'subtasks'").fetchone())
                 for table, _ in db.TABLES:
                     self.assertTrue(c.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone(), table)
                 self.assertEqual(c.execute('PRAGMA journal_mode').fetchone()[0], 'wal')
@@ -498,6 +592,37 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(st, 400)
         st, data, _ = self.req('POST', '/api/tasks', raw=b'[1,2]', headers={'Content-Type': 'application/json'})
         self.assertEqual(st, 400)
+
+    def test_subtask_api(self):
+        st, t, _ = self.req('POST', '/api/tasks', {'title': 'With subtasks'})
+        st, task, _ = self.req('POST', f'/api/tasks/{t["id"]}/subtasks', {'title': 'one'})
+        self.assertEqual(st, 201)
+        self.assertEqual([x['title'] for x in task['subtasks']], ['one'])
+        self.assertEqual(len(task['created_ids']), 1)
+        st, task, _ = self.req('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': ['two', {'title': 'three', 'done': True}]})
+        self.assertEqual(task['progress'], [1, 3])
+        sid = task['subtasks'][0]['id']
+        st, task, _ = self.req('PATCH', f'/api/subtasks/{sid}', {'done': True})
+        self.assertEqual((st, task['progress']), (200, [2, 3]))
+        ids = [x['id'] for x in task['subtasks']]
+        st, task, _ = self.req('POST', f'/api/tasks/{t["id"]}/subtasks/order', {'ids': ids[::-1]})
+        self.assertEqual([x['title'] for x in task['subtasks']], ['three', 'two', 'one'])
+        st, task, _ = self.req('DELETE', f'/api/subtasks/{sid}')
+        self.assertEqual((st, len(task['subtasks'])), (200, 2))
+        for method, path, body, status in [
+            ('POST', f'/api/tasks/{t["id"]}/subtasks', {'title': 'a', 'items': ['b']}, 400),
+            ('POST', f'/api/tasks/{t["id"]}/subtasks', {}, 400),
+            ('POST', f'/api/tasks/{t["id"]}/subtasks', {'title': ''}, 400),
+            ('POST', '/api/tasks/999999/subtasks', {'title': 'x'}, 404),
+            ('PATCH', f'/api/subtasks/{sid}', {'done': True}, 404),
+            ('PATCH', f'/api/subtasks/{ids[1]}', {'done': 'yes'}, 400),
+            ('PATCH', f'/api/subtasks/{ids[1]}', {'bogus': 1}, 400),
+            ('PATCH', f'/api/subtasks/{ids[1]}', {}, 400),
+            ('POST', f'/api/tasks/{t["id"]}/subtasks/order', {'ids': 'x'}, 400),
+        ]:
+            with self.subTest(path=path, body=body):
+                st, data, _ = self.req(method, path, body)
+                self.assertEqual(st, status, data)
 
     def test_images(self):
         st, data, _ = self.req('POST', '/api/images', raw=PNG, headers={'Content-Type': 'image/png'})

@@ -33,11 +33,13 @@ MAX_TITLE = 500
 MAX_DESCRIPTION = 200_000
 MAX_LABEL = 40
 MAX_LABELS_PER_TASK = 50
+MAX_SUBTASKS_PER_REQUEST = 500
 REMIND_DATE_ONLY_AT = '09:00'
 
 DATE_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})$')
 DATETIME_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$')
 COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
+STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$')
 IMG_RE = re.compile(r'!\[[^\]\n]*\]\(\s*(?:/images/[^\s)]+|https?://[^\s)]+)[^)\n]*\)')
 
 
@@ -93,6 +95,15 @@ TABLES = [
         key TEXT PRIMARY KEY,
         value TEXT
     )'''),
+    ('subtasks', '''CREATE TABLE IF NOT EXISTS subtasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        done INTEGER NOT NULL DEFAULT 0,
+        position INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+    )'''),
 ]
 
 ADDED_COLUMNS = [
@@ -103,6 +114,7 @@ ADDED_COLUMNS = [
 INDEXES = [
     ('idx_tasks_status', 'CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)'),
     ('idx_task_labels_label', 'CREATE INDEX IF NOT EXISTS idx_task_labels_label ON task_labels(label_id)'),
+    ('idx_subtasks_task', 'CREATE INDEX IF NOT EXISTS idx_subtasks_task ON subtasks(task_id, position)'),
 ]
 
 TRIGGERS = []
@@ -156,6 +168,17 @@ def clean_description(value):
     if len(value) > MAX_DESCRIPTION:
         raise ValidationError(f'Description is too long (at most {MAX_DESCRIPTION} characters).')
     return value.replace('\r\n', '\n').replace('\r', '\n')
+
+
+def clean_stamp(value, what='Timestamp'):
+    """A local timestamp YYYY-MM-DDTHH:MM:SS (used when restoring/importing)."""
+    if not isinstance(value, str) or not STAMP_RE.match(value):
+        raise ValidationError(f'{what} must look like 2026-10-06T14:30:00.')
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        raise ValidationError(f'{what} is not a valid date and time.')
+    return value
 
 
 def clean_status(value):
@@ -511,7 +534,13 @@ class Store:
         c.execute("DELETE FROM meta WHERE key = 'fts_dirty'")
 
     def _subtask_text(self, c, task_id):
-        return ''
+        cols = 'title, notes' if self._has_notes(c) else "title, '' AS notes"
+        return ' '.join(f'{r[0]} {r[1]}'.strip() for r in c.execute(
+            f'SELECT {cols} FROM subtasks WHERE task_id = ? ORDER BY position, id', (task_id,)))
+
+    @staticmethod
+    def _has_notes(c):
+        return any(r[1] == 'notes' for r in c.execute('PRAGMA table_info(subtasks)'))
 
     def _fts_insert(self, c, task_id):
         row = c.execute('SELECT title, description FROM tasks WHERE id = ?', (task_id,)).fetchone()
@@ -733,6 +762,152 @@ class Store:
             else:
                 c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('fts_dirty', '1')")
 
+    # -- subtasks ----------------------------------------------------------
+
+    def _clean_subtask_item(self, item):
+        """A new subtask: a title, or a dict (also used to restore a deleted one)."""
+        if isinstance(item, str):
+            item = {'title': item}
+        if not isinstance(item, dict):
+            raise ValidationError('Each subtask must be a title or an object.')
+        allowed = self.SUBTASK_ITEM_KEYS
+        for key in item:
+            if key not in allowed:
+                raise ValidationError(f'Unknown subtask field "{key}".')
+        out = {'title': clean_title(item.get('title'), 'Subtask title')}
+        done = item.get('done', False)
+        if not isinstance(done, bool):
+            raise ValidationError('Subtask "done" must be true or false.')
+        out['done'] = done
+        pos = item.get('position')
+        if pos is not None and (not isinstance(pos, int) or isinstance(pos, bool) or pos < 0):
+            raise ValidationError('Subtask position must be a whole number ≥ 0.')
+        out['position'] = pos
+        out['created_at'] = clean_stamp(item['created_at'], 'created_at') if item.get('created_at') else None
+        out['completed_at'] = clean_stamp(item['completed_at'], 'completed_at') if item.get('completed_at') else None
+        self._clean_subtask_item_extra(item, out)
+        return out
+
+    SUBTASK_ITEM_KEYS = ('title', 'done', 'position', 'created_at', 'completed_at')
+
+    def _clean_subtask_item_extra(self, item, out):
+        pass
+
+    @staticmethod
+    def _renumber(c, task_id):
+        ids = [r[0] for r in c.execute(
+            'SELECT id FROM subtasks WHERE task_id = ? ORDER BY position, id', (task_id,))]
+        for pos, sid in enumerate(ids):
+            c.execute('UPDATE subtasks SET position = ? WHERE id = ? AND position != ?', (pos, sid, pos))
+
+    def add_subtasks(self, task_id, items):
+        """Append subtasks (or insert them at their given positions).
+        Returns (task, new ids)."""
+        if not isinstance(items, list) or not items:
+            raise ValidationError('No subtasks given.')
+        if len(items) > MAX_SUBTASKS_PER_REQUEST:
+            raise ValidationError(f'At most {MAX_SUBTASKS_PER_REQUEST} subtasks at once.')
+        clean = [self._clean_subtask_item(it) for it in items]
+        now = now_dt()
+        stamp = now_iso(now)
+        with self.write() as c:
+            # Take the write lock with an UPDATE before reading positions, so
+            # concurrent adds can never share a position (BEGIN IMMEDIATE
+            # already holds it; the UPDATE also marks the task as edited).
+            cur = c.execute('UPDATE tasks SET updated_at = ? WHERE id = ?', (stamp, task_id))
+            if cur.rowcount == 0:
+                raise NotFound('Task not found.')
+            ids = []
+            for it in clean:
+                count = c.execute('SELECT count(*), coalesce(max(position) + 1, 0) FROM subtasks WHERE task_id = ?',
+                                  (task_id,)).fetchone()
+                end = max(count[0], count[1])
+                pos = end if it['position'] is None else min(it['position'], end)
+                if pos < end:
+                    c.execute('UPDATE subtasks SET position = position + 1 WHERE task_id = ? AND position >= ?',
+                              (task_id, pos))
+                completed = (it['completed_at'] or stamp) if it['done'] else None
+                cur = c.execute(
+                    'INSERT INTO subtasks(task_id, title, done, position, created_at, completed_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?)',
+                    (task_id, it['title'], int(it['done']), pos, it['created_at'] or stamp, completed))
+                sid = cur.lastrowid
+                self._add_subtask_extra(c, task_id, sid, it, now)
+                ids.append(sid)
+            self._renumber(c, task_id)
+            self._fts_sync(c, task_id)
+            return self._task(c, task_id), ids
+
+    def _add_subtask_extra(self, c, task_id, sid, item, now):
+        pass
+
+    def _subtask_row(self, c, sub_id):
+        row = c.execute('SELECT * FROM subtasks WHERE id = ?', (sub_id,)).fetchone()
+        if not row:
+            raise NotFound('Subtask not found.')
+        return row
+
+    def update_subtask(self, sub_id, fields):
+        now = now_dt()
+        stamp = now_iso(now)
+        with self.write() as c:
+            row = self._subtask_row(c, sub_id)
+            sets = {}
+            if 'title' in fields:
+                title = clean_title(fields['title'], 'Subtask title')
+                if title != row['title']:
+                    sets['title'] = title
+            if 'done' in fields:
+                done = fields['done']
+                if not isinstance(done, bool):
+                    raise ValidationError('Subtask "done" must be true or false.')
+                if done != bool(row['done']):
+                    sets['done'] = int(done)
+                    sets['completed_at'] = stamp if done else None
+            changed = self._update_subtask_extra(c, row, fields, sets, now)
+            if sets:
+                cols = ', '.join(f'{k} = ?' for k in sets)
+                c.execute(f'UPDATE subtasks SET {cols} WHERE id = ?', (*sets.values(), sub_id))
+            if sets or changed:
+                c.execute('UPDATE tasks SET updated_at = ? WHERE id = ?', (stamp, row['task_id']))
+                self._fts_sync(c, row['task_id'])
+            return self._task(c, row['task_id'])
+
+    def _update_subtask_extra(self, c, row, fields, sets, now):
+        return False
+
+    def delete_subtask(self, sub_id):
+        with self.write() as c:
+            row = self._subtask_row(c, sub_id)
+            c.execute('DELETE FROM subtasks WHERE id = ?', (sub_id,))
+            self._renumber(c, row['task_id'])
+            c.execute('UPDATE tasks SET updated_at = ? WHERE id = ?', (now_iso(), row['task_id']))
+            self._fts_sync(c, row['task_id'])
+            return self._task(c, row['task_id'])
+
+    def reorder_subtasks(self, task_id, ids):
+        """Put the listed subtasks in this order; unlisted ones (e.g. added
+        meanwhile in another window) keep their order after them."""
+        if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+            raise ValidationError('ids must be a list of subtask ids.')
+        if len(set(ids)) != len(ids):
+            raise ValidationError('A subtask is listed twice.')
+        with self.write() as c:
+            if not c.execute('SELECT 1 FROM tasks WHERE id = ?', (task_id,)).fetchone():
+                raise NotFound('Task not found.')
+            current = [r[0] for r in c.execute(
+                'SELECT id FROM subtasks WHERE task_id = ? ORDER BY position, id', (task_id,))]
+            foreign = [i for i in ids if i not in current]
+            if foreign:
+                raise ValidationError(f'Subtask {foreign[0]} does not belong to this task.')
+            order = ids + [i for i in current if i not in ids]
+            if order != current:
+                for pos, sid in enumerate(order):
+                    c.execute('UPDATE subtasks SET position = ? WHERE id = ?', (pos, sid))
+                c.execute('UPDATE tasks SET updated_at = ? WHERE id = ?', (now_iso(), task_id))
+                self._fts_sync(c, task_id)
+            return self._task(c, task_id)
+
     # -- reading tasks -----------------------------------------------------
 
     def _task(self, c, task_id, full=True):
@@ -744,8 +919,32 @@ class Store:
         return self._task_json(row, labels, extra.get(task_id), full=full, now=now_dt())
 
     def _task_children(self, c, task_ids, full=False):
-        """Per-task child data (subtasks etc.); filled in by later phases."""
-        return {}
+        """Subtask rows per task id, in position order."""
+        if not task_ids:
+            return {}
+        if len(task_ids) > 500:
+            rows = c.execute('SELECT * FROM subtasks ORDER BY task_id, position, id').fetchall()
+            wanted = set(task_ids)
+            rows = [r for r in rows if r['task_id'] in wanted]
+        else:
+            rows = c.execute(f'SELECT * FROM subtasks WHERE task_id IN ({",".join("?" * len(task_ids))}) '
+                             'ORDER BY task_id, position, id', tuple(task_ids)).fetchall()
+        out = {}
+        for r in rows:
+            out.setdefault(r['task_id'], []).append(r)
+        return out
+
+    @staticmethod
+    def _subtask_json(r, full=False):
+        return {
+            'id': r['id'],
+            'task_id': r['task_id'],
+            'title': r['title'],
+            'done': bool(r['done']),
+            'position': r['position'],
+            'created_at': r['created_at'],
+            'completed_at': r['completed_at'],
+        }
 
     def _task_json(self, row, labels, children, full=False, now=None):
         desc = row['description'] or ''
@@ -769,7 +968,9 @@ class Store:
         return d
 
     def _decorate(self, d, row, children, full):
-        pass
+        subs = [self._subtask_json(r, full) for r in children or ()]
+        d['subtasks'] = subs
+        d['progress'] = [sum(1 for s in subs if s['done']), len(subs)]
 
     @staticmethod
     def _relevant_dues(t):
@@ -830,7 +1031,8 @@ class Store:
 
     @staticmethod
     def _like_condition():
-        return "(t.title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\')"
+        return ("(t.title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\' OR EXISTS ("
+                "SELECT 1 FROM subtasks s WHERE s.task_id = t.id AND s.title LIKE ? ESCAPE '\\'))")
 
     def list_tasks(self, view='open', label_ids=(), match='any', q='', sort='newest'):
         if view not in VIEWS:
@@ -867,13 +1069,20 @@ class Store:
             for r in rows:
                 t = self._task_json(r, labels.get(r['id'], []), children.get(r['id']), now=now)
                 if self._in_view(view, t, now):
-                    self._mark_matches(t, words, label_ids, match)
+                    self._mark_matches(t, children.get(r['id'], ()), words, label_ids, match)
                     tasks.append(t)
         self._sort(tasks, sort, view)
         return tasks
 
-    def _mark_matches(self, t, words, label_ids, match):
-        pass
+    def _mark_matches(self, t, rows, words, label_ids, match):
+        """Which subtasks match a search, for showing them under a folded task."""
+        if words:
+            t['match_subs'] = [r['id'] for r in rows
+                               if text_matches_any(words, r['title'] + ' ' + self._row_notes(r))]
+
+    @staticmethod
+    def _row_notes(r):
+        return r['notes'] if 'notes' in r.keys() else ''
 
     @staticmethod
     def _sort(tasks, sort, view):
@@ -959,7 +1168,13 @@ class Store:
             return data
 
     def _export_extra(self, c, data):
-        pass
+        children = self._task_children(c, [t['id'] for t in data['tasks']])
+        for t in data['tasks']:
+            t['subtasks'] = [self._subtask_export(r) for r in children.get(t['id'], ())]
+
+    def _subtask_export(self, r):
+        return {k: r[k] for k in ('id', 'title', 'position', 'created_at', 'completed_at')} | {
+            'done': bool(r['done'])}
 
     def counts(self):
         with self.read() as c:

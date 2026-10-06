@@ -360,6 +360,17 @@ class Page:
     def type(self, text):
         self.send('Input.insertText', {'text': text})
 
+    def paste(self, text, origin):
+        """Put text on the clipboard and press Ctrl+V (a real paste event)."""
+        self.send('Browser.grantPermissions', {'permissions': ['clipboardReadWrite', 'clipboardSanitizedWrite'],
+                                               'origin': origin.rstrip('/')})
+        self.eval('navigator.clipboard.writeText(%s)' % json.dumps(text))
+        self.send('Input.dispatchKeyEvent', {'type': 'rawKeyDown', 'key': 'v', 'code': 'KeyV',
+                                             'windowsVirtualKeyCode': 86, 'modifiers': MOD['ctrl'],
+                                             'commands': ['paste']})
+        self.send('Input.dispatchKeyEvent', {'type': 'keyUp', 'key': 'v', 'code': 'KeyV',
+                                             'windowsVirtualKeyCode': 86, 'modifiers': MOD['ctrl']})
+
     def active(self):
         return self.eval('(() => { const a = document.activeElement; if (!a) return null;'
                          ' return a === document.body ? "BODY" : (a.dataset && a.dataset.k) || a.id || a.tagName; })()')
