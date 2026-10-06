@@ -4,6 +4,7 @@ Run:  python -m unittest tests.test_backend -v   (from the app folder)
 Every test uses scratch data and a test port; the real app is never touched.
 """
 
+import io
 import json
 import logging
 import os
@@ -1085,6 +1086,25 @@ class PlatformTests(unittest.TestCase):
             self.assertTrue(platforms.open_window('http://127.0.0.1:1/'))
             self.assertFalse(platforms.activate_window())
 
+    def test_problems_show_a_box_unless_there_is_no_window(self):
+        # Without a window nobody could close the box, and the app would wait forever.
+        import ctypes
+        for system in ('windows', 'mac', 'linux'):
+            with self.subTest(system):
+                self.on(system)
+                self.which('zenity')
+                windll = mock.Mock()
+                with mock.patch.object(ctypes, 'WinDLL', windll, create=True), \
+                        mock.patch.object(platforms, '_run') as run, \
+                        mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+                    with mock.patch.dict(os.environ, {'TODOTRACKER_NO_WINDOW': '1'}):
+                        platforms.message_box('Port 1 is in use.')
+                    self.assertEqual((windll.call_count, run.call_count), (0, 0))
+                    self.assertIn('Port 1 is in use.', err.getvalue())
+                    with mock.patch.dict(os.environ, {'TODOTRACKER_NO_WINDOW': '0'}):
+                        platforms.message_box('Port 1 is in use.')
+                    self.assertEqual((windll.call_count, run.call_count), (1, 0) if system == 'windows' else (0, 1))
+
     @unittest.skipIf(os.name == 'nt', 'POSIX process helpers')
     def test_process_helpers(self):
         self.assertTrue(platforms.process_alive(os.getpid()))
@@ -1092,6 +1112,19 @@ class PlatformTests(unittest.TestCase):
         child = subprocess.Popen([sys.executable, '-c', 'pass'])
         child.wait(10)
         self.assertFalse(platforms.process_alive(child.pid))
+
+        def zombie_counts_as_stopped():
+            # Exited, but not waited for by its parent (this test) yet.
+            child = subprocess.Popen([sys.executable, '-c', 'pass'])
+            try:
+                return platforms.wait_process_exit(child.pid, 10)
+            finally:
+                child.wait(10)
+
+        self.assertTrue(zombie_counts_as_stopped())
+        with mock.patch.object(platforms, 'open', side_effect=OSError, create=True):     # no /proc, as on macOS
+            self.assertTrue(platforms.process_alive(os.getpid()))
+            self.assertTrue(zombie_counts_as_stopped())
         if not platforms.shutil.which('lsof'):
             self.skipTest('lsof is not installed')
         import socket
@@ -1249,7 +1282,7 @@ class InstanceTests(unittest.TestCase):
         fake_dir = scratch_dir()
         self.cleanups.append(lambda: shutil.rmtree(fake_dir, ignore_errors=True))
         fake_src = (
-            'import json, os, sys\n'
+            'import json, os, socketserver, sys\n'
             'from http.server import BaseHTTPRequestHandler, HTTPServer\n'
             'class H(BaseHTTPRequestHandler):\n'
             '    def log_message(self, *a): pass\n'
@@ -1259,23 +1292,30 @@ class InstanceTests(unittest.TestCase):
             '        self.send_response(200); self.send_header("Content-Type", "application/json")\n'
             '        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)\n'
             '    do_GET = do_POST = reply\n'
-            'HTTPServer(("127.0.0.1", int(sys.argv[3])), H).serve_forever()\n')
+            'class S(HTTPServer):\n'
+            '    def server_bind(self):  # as server.py: HTTPServer\'s looks up a host name, which can stall\n'
+            '        socketserver.TCPServer.server_bind(self)\n'
+            '        self.server_name, self.server_port = self.server_address[:2]\n'
+            'S(("127.0.0.1", int(sys.argv[3])), H).serve_forever()\n')
         for name in ('todo.pyw', 'stubborn.py'):
             with open(os.path.join(fake_dir, name), 'w') as f:
                 f.write(fake_src)
 
         def fake(name):
+            err = open(os.path.join(fake_dir, name + '.err'), 'w+')
+            self.cleanups.append(err.close)
             p = subprocess.Popen([sys.executable, os.path.join(fake_dir, name), APP_DIR, data, str(port)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                 stdout=subprocess.DEVNULL, stderr=err)
             self.cleanups.append(lambda: p.kill())
-            deadline = time.time() + 10
-            while time.time() < deadline:
+            deadline = time.time() + 30
+            while time.time() < deadline and p.poll() is None:
                 try:
                     if request(port, 'GET', '/api/ping', timeout=1)[0] == 200:
                         return p
                 except OSError:
                     time.sleep(0.05)
-            raise AssertionError('fake did not start')
+            err.seek(0)
+            raise AssertionError(f'the fake {name} did not start (exit code {p.poll()}): {err.read()}')
 
         p = fake('stubborn.py')
         r = self.run_app(APP_DIR, port, data, timeout=60)

@@ -430,7 +430,9 @@ class Browser:
         self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
         port_file = os.path.join(self.profile, 'DevToolsActivePort')
-        deadline = time.time() + 20
+        # The first start on a fresh machine (cold disk and font caches) can
+        # take many times longer than later ones; a crash still ends this at once.
+        deadline = time.time() + 90
         while not os.path.exists(port_file) or os.path.getsize(port_file) == 0:
             if time.time() > deadline or self.proc.poll() is not None:
                 self.close()
@@ -443,7 +445,7 @@ class Browser:
 
     def _json(self, path, method='GET'):
         req = urllib.request.Request(self.base + path, method=method)
-        with _opener.open(req, timeout=10) as r:
+        with _opener.open(req, timeout=30) as r:      # (slow only while the browser is still cold)
             return json.loads(r.read().decode())
 
     def new_page(self, url='about:blank'):
@@ -481,6 +483,7 @@ class Browser:
         except Exception:
             try:
                 self.proc.kill()
+                self.proc.wait(10)
             except Exception:
                 pass
         shutil.rmtree(self.profile, ignore_errors=True)

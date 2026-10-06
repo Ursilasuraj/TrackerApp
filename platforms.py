@@ -270,18 +270,18 @@ def activate_window():
 def message_box(text):
     """Tell the user about a problem that stops the app from starting."""
     log.error(text)
-    if IS_WINDOWS:
-        try:
-            import ctypes
-            from ctypes import wintypes
-            user32 = ctypes.WinDLL('user32')
-            user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
-            user32.MessageBoxW(None, text, 'TodoTracker', 0x10)
-        except Exception:
-            pass
-        return
+    # (Without a window nobody could close the box: it would wait forever.)
     if os.environ.get('TODOTRACKER_NO_WINDOW') != '1':
-        if IS_MAC:
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                from ctypes import wintypes
+                user32 = ctypes.WinDLL('user32')
+                user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+                user32.MessageBoxW(None, text, 'TodoTracker', 0x10)
+            except Exception:
+                pass
+        elif IS_MAC:
             _run(['osascript', '-e', 'on run argv', '-e', 'display alert "TodoTracker" message (item 1 of argv)',
                   '-e', 'end run', text], timeout=120)
         elif shutil.which('zenity'):
@@ -355,11 +355,18 @@ def process_alive(pid):
         return False
     except PermissionError:
         return True
+    # kill() also succeeds for a process that has exited but that its parent
+    # has not waited for yet (a zombie); its state tells.
     try:
         with open(f'/proc/{int(pid)}/stat') as f:
             return f.read().split(')')[-1].split()[0] != 'Z'
     except OSError:
+        pass
+    result = _run(['ps', '-o', 'stat=', '-p', str(int(pid))], timeout=10)     # no /proc (macOS)
+    if result is None:
         return True
+    state = result.stdout.decode('ascii', 'replace').strip()
+    return bool(state) and not state.startswith('Z')
 
 
 def wait_process_exit(pid, timeout):

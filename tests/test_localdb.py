@@ -79,6 +79,7 @@ class NodeSide:
     def close(self):
         self.proc.stdin.close()
         self.proc.wait(10)
+        self.proc.stdout.close()
 
 
 def normalize(method, path, resp):
