@@ -84,6 +84,10 @@ class UICase(unittest.TestCase):
         return self.page.eval('Array.from(document.querySelectorAll("#list .row-title")).map(e => e.textContent)')
 
     def row_sel(self, title, part='.row-title'):
+        # Aim only at a settled list: a refresh landing between finding the
+        # row and pressing on it would move the row away (and the test would
+        # click the empty list).
+        self.page.wait_for('TT.idle()', timeout=8)
         idx = self.page.eval('Array.from(document.querySelectorAll("#list .row")).findIndex(r => '
                              'r.querySelector(".row-title").textContent === %s)' % js(title))
         self.assertGreaterEqual(idx, 0, f'row {title!r} not found in {self.titles()}')
@@ -1343,6 +1347,255 @@ class ThemeTests(UICase):
             p.key('Escape')
         self.maxDiff = None
         self.assertEqual(failures, [], "\n".join(failures))
+
+
+class PhoneTests(UICase):
+    """A 390 x 844 touch screen (a typical phone): taps, swipes and holds."""
+
+    W, H = 390, 844
+
+    def open_phone(self, dark=False):
+        self.page = self.browser.new_page()
+        p = self.page
+        p.send('Emulation.setDeviceMetricsOverride', {'width': self.W, 'height': self.H, 'deviceScaleFactor': 2, 'mobile': True})
+        p.send('Emulation.setTouchEmulationEnabled', {'enabled': True, 'maxTouchPoints': 5})
+        # Reduced motion: no sliding drawer, so a tap never lands mid-animation.
+        p.send('Emulation.setEmulatedMedia', {'features': [{'name': 'prefers-color-scheme', 'value': 'dark' if dark else 'light'},
+                                                           {'name': 'prefers-reduced-motion', 'value': 'reduce'}]})
+        p.navigate(self.srv.url)
+        p.wait_for('!!(window.TT && TT.S.loaded)', timeout=8)
+        self.assertTrue(p.eval('matchMedia("(pointer: coarse)").matches && TT.NARROW.matches'))
+        return p
+
+    def fits(self, where):
+        """Nothing scrolls sideways, and everything to tap is at least 24 x 24 px (WCAG 2.2)."""
+        p = self.page
+        wide = p.eval('Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - innerWidth')
+        small = p.eval(r"""(() => Array.from(document.querySelectorAll(
+              'button, input, select, textarea, [role=button], a[href]'))
+            .filter((el) => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden'
+              && !el.matches('.sr-only, .skip, input[type=color], input[type=file]') && !el.closest('[hidden], [inert]'))
+            .map((el) => { const r = el.getBoundingClientRect();
+              return [el.dataset.k || el.id || String(el.className) || el.tagName, Math.round(r.width), Math.round(r.height)]; })
+            .filter(([k, w, h]) => w < 24 || h < 24))()""")
+        out = [f'{where}: page is {wide}px too wide'] if wide > 0 else []
+        return out + [f'{where}: small target {k} {w}x{h}' for k, w, h in small]
+
+    def scan(self, where):
+        p = self.page
+        if not p.eval('typeof window.__ttContrastScan === "function"'):
+            with open(os.path.join(HERE, 'contrast_scan.js'), encoding='utf-8') as f:
+                p.eval(f.read())
+        return [f'{where}: {x}' for x in p.eval('window.__ttContrastScan()')] + self.fits(where)
+
+    def drawer_open(self):
+        return self.page.eval('document.querySelector("#sidebar").classList.contains("open")')
+
+    def test_drawer_closes_on_backdrop_choice_and_back(self):
+        self.task('Pay rent', labels=['home'], due_at=time.strftime('%Y-%m-%d'))
+        self.task('Call mum', labels=['family'])
+        p = self.open_phone()
+        p.tap('#menu-btn')
+        p.wait_for('document.querySelector("#sidebar").classList.contains("open")')
+        self.assertTrue(p.eval('!document.querySelector("#drawer-backdrop").hidden && document.querySelector("#main").inert'))
+        self.assertEqual(p.active(), 'nav:open')
+        p.tap(x=self.W - 20, y=self.H / 2)            # the dimmed list beside the drawer
+        p.wait_for('!document.querySelector("#sidebar").classList.contains("open")')
+        self.assertEqual(p.eval('document.activeElement.id'), 'menu-btn')
+        self.assertFalse(p.eval('document.querySelector("#main").inert'))
+        # Picking a label keeps the drawer open (several can be picked); a view closes it.
+        p.tap('#menu-btn')
+        p.wait_for('document.querySelector("#sidebar").classList.contains("open")')
+        label = p.eval('TT.S.meta.labels.find(l => l.name === "home").id')
+        p.tap(f'[data-k="lbl:{label}:name"]')
+        p.wait_for(f'TT.S.labelIds.includes({label})')
+        self.assertTrue(self.drawer_open())
+        p.tap('[data-k="nav:today"]')
+        p.wait_for('!document.querySelector("#sidebar").classList.contains("open") && document.querySelector("#view-title").textContent === "Today"')
+        self.wait_rows(['Pay rent'])
+        # The close button, and the phone's Back button.
+        p.tap('#menu-btn')
+        p.wait_for('document.querySelector("#sidebar").classList.contains("open")')
+        p.tap('#menu-close')
+        p.wait_for('!document.querySelector("#sidebar").classList.contains("open")')
+        p.tap('#menu-btn')
+        p.wait_for('document.querySelector("#sidebar").classList.contains("open")')
+        self.assertTrue(p.eval('TT.back()'))
+        self.assertFalse(self.drawer_open())
+        self.assertFalse(p.eval('TT.back()'), 'nothing left to close')
+
+    def test_quick_add_button_keeps_the_keyboard_up(self):
+        p = self.open_phone()
+        p.tap('#qa')
+        p.type('Buy milk #shop !high')
+        p.tap('#qa-add')
+        self.wait_rows(['Buy milk'])
+        self.assertEqual(p.eval('[document.activeElement.id, document.querySelector("#qa").value]'), ['qa', ''])
+        task = self.api('GET', '/api/tasks')['tasks'][0]
+        self.assertEqual((task['priority'], [l['name'] for l in task['labels']]), ('high', ['shop']))
+
+    def test_editor_fills_the_screen_and_back_closes_it(self):
+        t = self.task('Plan the trip', description='Ideas')
+        self.api('POST', f'/api/tasks/{t["id"]}/subtasks', {'items': [{'title': 'Book flights'}, {'title': 'Pack'}]}, expect=201)
+        p = self.open_phone()
+        p.tap(self.row_sel('Plan the trip'))
+        p.wait_for('!!document.querySelector("#editor:not([hidden]) .ed-title")')
+        r = p.rect('#editor', scroll=False)
+        self.assertEqual((round(r['x']), round(r['w']), round(r['h'])), (0, self.W, self.H))
+        # Controls that show on hover with a mouse are always there on a touch screen.
+        sid = p.eval('TT.E.task.subtasks[0].id')
+        self.assertEqual(p.eval(f'getComputedStyle(document.querySelector(\'[data-k="s{sid}:del"]\')).opacity'), '1')
+        self.assertEqual(self.fits('editor'), [])
+        # The header stays on screen while the details scroll.
+        p.eval('document.querySelector("#editor").scrollTop = 600')
+        time.sleep(0.2)
+        self.assertLess(abs(p.rect('[data-k="ed:close"]', scroll=False)['y'] - p.rect('.ed-head', scroll=False)['y']), 30)
+        self.assertGreaterEqual(p.rect('.ed-head', scroll=False)['y'], -1)
+        p.tap('[data-k="ed:close"]')
+        p.wait_for('document.querySelector("#editor").hidden')
+        p.tap(self.row_sel('Plan the trip'))
+        p.wait_for('!document.querySelector("#editor").hidden')
+        self.assertTrue(p.eval('TT.back()'))
+        p.wait_for('document.querySelector("#editor").hidden')
+
+    def test_add_image_button(self):
+        self.task('Receipt')
+        path = os.path.join(self.srv.data, 'photo.png')
+        with open(path, 'wb') as f:
+            f.write(PNG)
+        p = self.open_phone()
+        p.tap(self.row_sel('Receipt'))
+        p.wait_for('!!document.querySelector(\'[data-k="ed:add-image"]\')')
+        p.send('Page.setInterceptFileChooserDialog', {'enabled': True})
+        p.take_events()
+        p.tap('[data-k="ed:add-image"]')
+        deadline = time.time() + 5
+        chooser = None
+        while time.time() < deadline and not chooser:
+            ev = p.take_events('Page.fileChooserOpened')
+            chooser = ev[0]['params'] if ev else None
+            time.sleep(0.05)
+        self.assertIsNotNone(chooser, 'the file chooser opened')
+        p.send('DOM.setFileInputFiles', {'files': [path], 'backendNodeId': chooser['backendNodeId']})
+        p.wait_for(r'/!\[photo\]\(\/images\/[0-9a-f]{32}\.png\)/.test(document.querySelector("#ed-desc").value)', timeout=8)
+        self.wait_saved()
+        tid = p.eval('TT.E.task.id')
+        self.assertRegex(self.server_task(tid)['description'], r'!\[photo\]\(/images/[0-9a-f]{32}\.png\)')
+        p.wait_for('!!document.querySelector(".md-preview img")')
+
+    def test_matrix_as_lists_move_and_link_by_tapping(self):
+        today = time.strftime('%Y-%m-%d')
+        a = self.task('Call the plumber', due_at=today, priority='high')
+        b = self.task('Fix the sink')
+        p = self.open_phone()
+        p.tap('#menu-btn')
+        p.wait_for('document.querySelector("#sidebar").classList.contains("open")')
+        p.tap('[data-k="nav:matrix"]')
+        p.wait_for('!!document.querySelector(".mx-lists") && !document.querySelector("#mx-board")', timeout=8)
+        self.assertFalse(self.drawer_open())
+        ka, kb = f't{a["id"]}', f't{b["id"]}'
+        # Tap an unsorted item, then "Do".
+        p.tap(f'.tray-item[data-key="{ka}"] .tray-title')
+        p.wait_for('!!document.querySelector(".mx-actions")')
+        p.tap('[data-k="mxa:do"]')
+        p.wait_for(f'!!document.querySelector(\'.mx-list.q-do .mx-li[data-key="{ka}"]\')')
+        p.wait_for('!TT.matrixBusy()')
+        pos = self.server_task(a['id'])['matrix']
+        self.assertTrue(pos[0] >= 0.5 and pos[1] >= 0.5, pos)
+        self.assertEqual(p.eval('document.querySelector(\'[data-k="mxa:do"]\').getAttribute("aria-pressed")'), 'true')
+        # "Must happen before…", then tap the item that waits.
+        p.tap('[data-k="mxa:link"]')
+        p.wait_for('!!document.querySelector(".mx-actions.linking")')
+        p.tap(f'.tray-item[data-key="{kb}"] .tray-title')
+        p.wait_for('TT.matrix && document.querySelectorAll(".mx-link-chip").length === 1')
+        deps = self.api('GET', '/api/deps')['deps']
+        self.assertEqual([(d['before'], d['after']) for d in deps], [(ka, kb)])
+        dep = deps[0]['id']
+        p.tap(f'[data-k="mxa:unlink:{dep}"]')
+        p.wait_for('!document.querySelector(".mx-link-chip")')
+        self.assertEqual(self.api('GET', '/api/deps')['deps'], [])
+        # Back to the tray, then the Back button clears the selection and leaves the matrix.
+        p.tap('[data-k="mxa:tray"]')
+        p.wait_for(f'!!document.querySelector(\'.tray-item[data-key="{ka}"]\')')
+        p.wait_for('!TT.matrixBusy()')
+        self.assertIsNone(self.server_task(a['id'])['matrix'])
+        self.assertTrue(p.eval('TT.back()'))
+        p.wait_for('!document.querySelector(".mx-actions")')
+        self.assertTrue(p.eval('TT.back()'))
+        p.wait_for('!document.querySelector("#list-page").hidden')
+
+    def test_board_swipe_scrolls_and_hold_drags(self):
+        a = self.task('Water the plants')
+        for i in range(8):
+            self.task(f'Unsorted {i}')     # a tray long enough to scroll the page
+        self.api('POST', '/api/matrix', {'items': [{'key': f't{a["id"]}', 'matrix': [0.2, 0.8]}]}, expect=200)
+        p = self.open_phone()
+        p.eval('TT.showPage("matrix")')
+        p.wait_for('!!document.querySelector(".mx-lists")', timeout=8)
+        p.tap('[data-k="mxv:board"]')
+        p.wait_for('!!document.querySelector("#mx-board .note")', timeout=8)
+        note = f'#mx-board .note[data-key="t{a["id"]}"]'
+        x, y = p.center(note + ' .note-title')
+        top = p.eval('document.querySelector(".matrix-page").scrollTop')
+        p.touch_drag(x, y, x, y - 150)                 # a swipe that starts on the note
+        p.wait_for(f'document.querySelector(".matrix-page").scrollTop > {top + 60}')
+        time.sleep(0.3)
+        self.assertEqual(self.server_task(a['id'])['matrix'], [0.2, 0.8], 'a swipe must not move the note')
+        x, y = p.center(note + ' .note-title')
+        top = p.eval('document.querySelector(".matrix-page").scrollTop')
+        p.touch_drag(x, y, x + 100, y + 200, hold=0.6)   # hold, then drag down and right
+        p.wait_for(f'!TT.matrixBusy() && TT.taskById({a["id"]}).matrix[1] < 0.5', timeout=5)
+        self.assertEqual(p.eval('document.querySelector(".matrix-page").scrollTop'), top, 'the drag must not scroll the page')
+        moved = self.server_task(a['id'])['matrix']
+        self.assertGreater(moved[0], 0.3)
+        self.assertLess(moved[1], 0.5)
+        self.assertEqual(self.server_task(a['id'])['priority'], 'low', 'moved to the bottom half')
+
+    def test_phone_screens_contrast_and_fit_in_both_themes(self):
+        today = time.strftime('%Y-%m-%d')
+        a = self.task('Overdue thing with a long title that wraps on a phone', due_at='2020-02-02', priority='high',
+                      labels=['work', 'urgent'], description='- [ ] check me\n- [x] done')
+        b = self.task('Today thing', due_at=today, labels=['home'])
+        self.api('POST', f'/api/tasks/{b["id"]}/subtasks', {'items': [
+            {'title': 'Sub with details', 'due_at': today, 'labels': ['home'], 'notes': 'A note'}, {'title': 'Second'}]}, expect=201)
+        self.api('POST', '/api/matrix', {'items': [{'key': f't{a["id"]}', 'matrix': [0.8, 0.8]}]}, expect=200)
+        self.api('POST', '/api/deps', {'before': f't{b["id"]}', 'after': f't{a["id"]}'})
+        failures = []
+        for dark in (False, True):
+            theme = 'dark' if dark else 'light'
+            p = self.open_phone(dark)
+            p.tap(self.row_sel('Today thing', '.sub-badge'))
+            p.wait_for('!!document.querySelector(".mini-sub")')
+            failures += self.scan(f'{theme}/list')
+            p.tap('#menu-btn')
+            p.wait_for('document.querySelector("#sidebar").classList.contains("open")')
+            time.sleep(0.3)
+            failures += self.scan(f'{theme}/drawer')
+            p.tap('#menu-close')
+            p.wait_for('!document.querySelector("#sidebar").classList.contains("open")')
+            time.sleep(0.3)
+            p.tap(self.row_sel('Today thing'))
+            p.wait_for('!!document.querySelector("#editor:not([hidden]) .ed-title")')
+            sid = p.eval('TT.E.task.subtasks[0].id')
+            p.tap(f'[data-k="s{sid}:more"]')
+            p.wait_for('!!document.querySelector(".sub-details")')
+            failures += self.scan(f'{theme}/editor')
+            p.tap('[data-k="ed:close"]')
+            p.wait_for('document.querySelector("#editor").hidden')
+            p.eval('TT.showPage("matrix")')
+            p.wait_for('!!document.querySelector(".mx-lists .mx-li")', timeout=8)
+            p.tap(f'.mx-li[data-key="t{a["id"]}"] .mx-li-title')
+            p.wait_for('!!document.querySelector(".mx-actions .mx-link-chip")')
+            failures += self.scan(f'{theme}/matrix-lists')
+            p.tap('[data-k="mxv:board"]')
+            p.wait_for('!!document.querySelector("#mx-board .note")')
+            failures += self.scan(f'{theme}/matrix-board')
+            p.tap('[data-k="mxv:lists"]')
+            p.wait_for('!!document.querySelector(".mx-lists")')
+            self.browser.close_page(p)
+            self.page = None
+        self.maxDiff = None
+        self.assertEqual(failures, [], '\n'.join(failures))
 
 
 class UpdateTests(UICase):

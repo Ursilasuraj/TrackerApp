@@ -298,6 +298,15 @@
     return { quad, pos: [Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000] };
   }
 
+  /** A spot inside a quadrant for an item moved there with a button
+   *  (the quadrant's centre plus the item's own small spread). */
+  function positionIn(quad, key) {
+    const [dx, dy] = spread(key);
+    const x = (quad === 'do' || quad === 'delegate' ? 0.75 : 0.25) + dx * 0.12;
+    const y = (quad === 'do' || quad === 'schedule' ? 0.75 : 0.25) + dy * 0.12;
+    return [Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000];
+  }
+
   /** Priority that follows a manual move of a task note (null: unchanged).
    *  Crossing into the top half sets High, into the bottom half Low; moving
    *  within a half never changes it. From the tray, only a contradiction is
@@ -316,7 +325,7 @@
   }
 
   return {
-    quadrantOf, spread, suggestPlacement, priorityForMove,
+    quadrantOf, spread, suggestPlacement, positionIn, priorityForMove,
     parseDue, parseTime, parseQuickAdd, parseSubtaskTitle, labelFromToken, labelQueryAt,
     suggestLabels, splitPastedLines, isOverdue, dueState, dueLabel, dueLong, stampLabel,
     dueGroup, dayDiff, parseYMD, ymd, addDays, startOfDay, pad, MONTHS, WEEKDAY_NAMES,

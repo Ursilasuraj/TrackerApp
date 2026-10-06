@@ -262,3 +262,15 @@ test('priority follows manual moves of task notes', () => {
   assert.equal(P.quadrantOf([0.5, 0.49]), 'delegate');
   assert.equal(P.quadrantOf(null), null);
 });
+
+test('positionIn: a spot inside the chosen quadrant (Move to … buttons)', () => {
+  for (const quad of ['do', 'schedule', 'delegate', 'eliminate']) {
+    for (const key of ['t1', 't2', 's17', 't999', 's3']) {
+      const pos = P.positionIn(quad, key);
+      assert.equal(P.quadrantOf(pos), quad, `${key} in ${quad}: ${pos}`);
+      assert.ok(pos.every((v) => v > 0.05 && v < 0.95), `${key} not at an edge: ${pos}`);
+    }
+  }
+  assert.deepEqual(P.positionIn('do', 't1'), P.positionIn('do', 't1'));
+  assert.notDeepEqual(P.positionIn('do', 't1'), P.positionIn('do', 't2'));
+});

@@ -32,9 +32,11 @@
 <div id="banner" class="banner" role="alert" hidden></div>
 <div id="app" class="app">
   <aside id="sidebar" class="sidebar" aria-label="Views and labels">
-    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>TodoTracker</div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>TodoTracker
+      <button id="menu-close" class="icon-btn menu-close" type="button" aria-label="Close views and labels">✕</button></div>
     <div id="side-content"></div>
   </aside>
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
 
   <main id="main" class="main">
     <header class="topbar">
@@ -47,6 +49,7 @@
         <ul id="qa-suggest" class="suggest" role="listbox" aria-label="Label suggestions" hidden></ul>
         <div id="qa-chips" class="qa-chips" aria-live="polite"></div>
       </div>
+      <button id="qa-add" class="btn primary qa-add" type="button" aria-label="Add the task">Add</button>
       <div class="search">
         <label class="sr-only" for="search">Search</label>
         <input id="search" data-k="search" type="search" autocomplete="off" placeholder="Search  (Ctrl+F)">
@@ -82,6 +85,7 @@
   <img alt="">
 </div>
 <input id="import-file" type="file" accept="application/json,.json" hidden>
+<input id="image-file" type="file" accept="image/*" multiple hidden>
 
 <script src="/markdown.js?b=__BUILD__"></script>
 <script src="/parse.js?b=__BUILD__"></script>

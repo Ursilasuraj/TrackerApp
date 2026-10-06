@@ -17,6 +17,8 @@
   const ROOT = document.documentElement;
   const BOOT = { api: Number(ROOT.dataset.api) || 0, build: ROOT.dataset.build || '' };
   const CLIENT_API = 5;            // the server API this page is written for
+  const NARROW = window.matchMedia('(max-width: 760px)');           // phone layout
+  const TOUCH = window.matchMedia('(pointer: coarse)');             // finger, not mouse
   const FEATURE_API = { subtasks: 2, subtaskDetails: 3, import: 5 };   // feature -> minimum server API
   const KEEPALIVE_BUDGET = 60000;  // Chromium allows 64 KB of keepalive bodies in flight
   const STATUS_NAMES = { open: 'Open', in_progress: 'In progress', done: 'Done' };
@@ -52,7 +54,7 @@
 
   // ------------------------------------------------------------- API
 
-  const net = { inflight: 0, own: new Set(), lastChanges: null, epoch: null, failures: 0 };
+  const net = { inflight: 0, loading: 0, refreshDue: false, own: new Set(), lastChanges: null, epoch: null, failures: 0 };
 
   async function api(method, path, body, opts) {
     const init = { method, headers: {} };
@@ -334,6 +336,7 @@
 
   function scheduleRefresh(delay) {
     clearTimeout(refreshTimer);
+    net.refreshDue = true;
     refreshTimer = setTimeout(refresh, delay == null ? 150 : delay);
   }
 
@@ -346,7 +349,9 @@
 
   async function refresh() {
     clearTimeout(refreshTimer);
+    net.refreshDue = false;
     const seq = ++refreshSeq;
+    net.loading++;
     try {
       const view = S.page === 'matrix' && TT.matrixView ? TT.matrixView() : S.view;
       const [list, meta] = await Promise.all([
@@ -363,7 +368,16 @@
       emit('refresh');
     } catch (e) {
       if (seq === refreshSeq && !e.network) errorToast('Could not load tasks:', e);
+    } finally {
+      net.loading--;
     }
+  }
+
+  /** Nothing loading, saving or waiting to be drawn (tests wait for this
+   *  before they aim at something on screen). */
+  function idle() {
+    return !net.loading && !net.refreshDue && !net.inflight && !held() && !hold.queue.size
+      && !(TT.subtaskBusy && TT.subtaskBusy()) && !(TT.matrixBusy && TT.matrixBusy());
   }
 
   // Later phases keep optimistic local data while their writes are queued.
@@ -589,6 +603,7 @@
       const el = e.target.closest('[data-act]');
       if (!el || !side.contains(el)) return;
       const act = el.dataset.act;
+      if (['view', 'matrix', 'export', 'import', 'backup'].includes(act)) closeDrawer();
       if (act === 'view') setView(el.dataset.view);
       else if (act === 'label') toggleLabel(Number(el.dataset.label));
       else if (act === 'match') {
@@ -806,8 +821,25 @@
     qa.select();
   }
 
+  const QA_PLACEHOLDER = {
+    long: 'Add a task…  #label  !high  ^fri@14:00   (Enter adds, Shift+Enter adds and opens)',
+    short: 'Add a task…  #label !high ^fri',
+  };
+
+  function fitQuickAddPlaceholder() {
+    $('#qa').placeholder = NARROW.matches || TOUCH.matches ? QA_PLACEHOLDER.short : QA_PLACEHOLDER.long;
+  }
+
   function bindQuickAdd() {
     const qa = $('#qa');
+    fitQuickAddPlaceholder();
+    NARROW.addEventListener('change', fitQuickAddPlaceholder);
+    TOUCH.addEventListener('change', fitQuickAddPlaceholder);
+    $('#qa-add').addEventListener('mousedown', (e) => { if (document.activeElement === qa) e.preventDefault(); });
+    $('#qa-add').addEventListener('click', () => {
+      submitQuickAdd(false);
+      if (TOUCH.matches) qa.focus({ preventScroll: true });   // keep the keyboard up for the next one
+    });
     qa.addEventListener('input', () => {
       qaSug.arrowUsed = false;
       qaSug.active = -1;
@@ -1115,7 +1147,9 @@
       + (TT.editorSubtasksHTML ? TT.editorSubtasksHTML(t) : '')
       + '<div class="ed-desc">'
       + '<div class="ed-section-title"><label for="ed-desc">Description</label><span class="grow"></span>'
-      + '<span style="text-transform:none;letter-spacing:0;font-weight:400">Markdown · paste or drop images</span></div>'
+      + '<span class="md-hint">Markdown<span class="desk-only"> · paste or drop images</span></span>'
+      + '<button type="button" class="btn add-image" data-act="add-image" data-k="ed:add-image">'
+      + '<span aria-hidden="true">🖼</span> Add image</button></div>'
       + '<textarea id="ed-desc" data-k="ed:desc" rows="7" spellcheck="true">\n' + esc(desc) + '</textarea>'
       + '<div class="md-tools">'
       + (checklist.length && TT.convertChecklist
@@ -1434,6 +1468,18 @@
     return Array.from(list || []).filter((f) => f.type && f.type.startsWith('image/'));
   }
 
+  /** "Add image": choose pictures (on a phone: gallery or camera). */
+  function pickImages() {
+    const input = $('#image-file');
+    input.value = '';
+    input.onchange = () => {
+      const ta = $(kq('ed:desc'));
+      const files = imageFiles(input.files);
+      if (ta && files.length) uploadImages(ta, files);
+    };
+    input.click();
+  }
+
   function bindEditor() {
     const panel = $('#editor');
     panel.addEventListener('click', (e) => {
@@ -1443,6 +1489,7 @@
       if (!el || !panel.contains(el)) return;
       const act = el.dataset.act;
       if (act === 'close') closeEditor();
+      else if (act === 'add-image') pickImages();
       else if (act === 'nodate') {
         queueField(E.task.id, 'due_at', null, 0);
         renderEditor();
@@ -1763,13 +1810,31 @@
       }
     });
     $('#menu-btn').addEventListener('click', () => toggleMenu());
+    $('#menu-close').addEventListener('click', () => toggleMenu(false));
+    $('#drawer-backdrop').addEventListener('click', () => toggleMenu(false));
+    NARROW.addEventListener('change', () => { if (!NARROW.matches) toggleMenu(false); });
   }
 
+  /** The sidebar is a drawer on narrow screens (phones). */
   function toggleMenu(force) {
     const side = $('#sidebar');
-    const open = force == null ? !side.classList.contains('open') : force;
+    const wasOpen = side.classList.contains('open');
+    const open = (force == null ? !wasOpen : force) && NARROW.matches;
     side.classList.toggle('open', open);
     $('#menu-btn').setAttribute('aria-expanded', String(open));
+    $('#drawer-backdrop').hidden = !open;
+    $('#main').inert = open;
+    if (open && !wasOpen) {
+      const current = $('#sidebar [aria-current="page"]') || $('#menu-close');
+      current.focus({ preventScroll: true });
+    } else if (!open && wasOpen && (side.contains(document.activeElement) || document.activeElement === document.body)) {
+      $('#menu-btn').focus({ preventScroll: true });   // (a tap on the backdrop leaves focus nowhere)
+    }
+  }
+
+  /** After picking a view (or an action) in the drawer, show the result. */
+  function closeDrawer() {
+    if ($('#sidebar').classList.contains('open')) toggleMenu(false);
   }
 
   // ------------------------------------------------------------- subtasks
@@ -2717,6 +2782,18 @@
     return best && (!t.due_at || best < t.due_at) ? best : null;
   }
 
+  /** The phone's Back button: close the topmost thing. False when there is
+   *  nothing left to close (the app may then go to the background). */
+  function back() {
+    if (closeLightbox()) return true;
+    if (S.openId) { closeEditor(); return true; }
+    if ($('#sidebar').classList.contains('open')) { toggleMenu(false); return true; }
+    if (TT.escape && TT.escape({ preventDefault() {} })) return true;
+    if (S.page === 'matrix') { TT.showPage('list'); return true; }
+    if ($('#search').value) { clearSearch(); return true; }
+    return false;
+  }
+
   // ------------------------------------------------------------- boot
 
   const TT = {
@@ -2739,6 +2816,8 @@
     subtaskChangeExtra, subtaskInputExtra, subtaskFocusoutExtra, subtaskKeydownExtra, listActionExtra,
     pendingSubtaskExtra: pendingNotesRequests, clearSubtaskExtra: clearNotes, flushSubtaskExtra: flushAllNotes,
     earlierSubtaskDue, firstLine,
+    // phones
+    NARROW, TOUCH, back, closeDrawer, idle,
     showPage(page) {
       S.page = page === 'matrix' && TT.matrix ? 'matrix' : 'list';
       $('#list-page').hidden = S.page !== 'list';

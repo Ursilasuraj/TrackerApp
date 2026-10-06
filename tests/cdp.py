@@ -339,6 +339,28 @@ class Page:
 
     # -- keyboard ------------------------------------------------------------
 
+    # -- touch (needs Emulation.setTouchEmulationEnabled) -----------------
+
+    def touch(self, kind, points):
+        self.send('Input.dispatchTouchEvent', {'type': kind, 'touchPoints': [{'x': x, 'y': y} for x, y in points]})
+
+    def tap(self, selector=None, x=None, y=None, hold=0.05):
+        if selector:
+            x, y = self.center(selector)
+        self.touch('touchStart', [(x, y)])
+        time.sleep(hold)
+        self.touch('touchEnd', [])
+
+    def touch_drag(self, x0, y0, x1, y1, hold=0.05, steps=20, pause=0.03):
+        """Finger down, optional hold, move in steps (slow enough to scroll), up."""
+        self.touch('touchStart', [(x0, y0)])
+        time.sleep(hold)
+        for i in range(1, steps + 1):
+            self.touch('touchMove', [(x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps)])
+            time.sleep(pause)
+        time.sleep(0.1)
+        self.touch('touchEnd', [])
+
     def key(self, key, *mods, repeat=False, commands=None):
         modifiers = sum(MOD[m] for m in mods)
         if key in KEYS:

@@ -23,6 +23,8 @@
   const BAND = 48;            // px kept free for the quadrant titles (top and bottom)
   const STEP = 0.02;          // arrow-key move, Shift: 0.1
   const DRAG_START = 4;       // px before a press becomes a drag
+  const HOLD_MS = 350;        // touch: hold this long to pick a note up (a swipe scrolls)
+  const HOLD_SLOP = 10;       // px a finger may wander while holding
 
   const M = {
     deps: [],
@@ -32,6 +34,8 @@
       subs: TT.load('tt-mx-subs', true) !== false,
       done: TT.load('tt-mx-done', false) === true,
     },
+    view: TT.load('tt-mx-view', 'lists') === 'board' ? 'board' : 'lists',   // phones only
+    linking: null,        // phones: key waiting for the tap on the item that must wait for it
     trace: null,          // key whose chain is highlighted
     selectedDep: null,    // id of the selected link
     highlight: null,      // {keys:Set, label} from a warning
@@ -174,6 +178,93 @@
       + '</div>';
   }
 
+  /** Phones show the quadrants as lists (notes would pile up on a small
+   *  board); the board stays one tap away. */
+  function listsMode() { return TT.NARROW.matches && M.view === 'lists'; }
+
+  function byImportance(a, b) {
+    return (b.pos[1] - a.pos[1]) || (b.pos[0] - a.pos[0]);
+  }
+
+  function listItemHTML(it, now) {
+    const waits = waitsFor(it.key);
+    const meta = [];
+    const due = it.kind === 'task' ? it.due : it.ownDue;
+    if (due) {
+      const st = it.done ? 'future' : P.dueState(due, now);
+      meta.push('<span class="badge due ' + st + '">⏱ ' + esc(P.dueLabel(due, now)) + '</span>');
+    }
+    if (it.kind === 'sub') meta.push('<span class="note-parent">↳ ' + esc(it.task.title) + '</span>');
+    else if (it.progress && it.progress[1]) meta.push('<span class="badge">' + it.progress[0] + '/' + it.progress[1] + '</span>');
+    if (waits.length) meta.push('<span class="badge waits">⛓ waits for ' + waits.length + '</span>');
+    const cls = ['mx-li', it.kind === 'task' ? 'is-task' : 'is-sub'];
+    if (it.done) cls.push('done');
+    if (M.trace) cls.push(M.traceSet.has(it.key) ? (it.key === M.trace ? 'traced origin' : 'traced') : 'dim');
+    else if (M.highlight) cls.push(M.highlight.keys.has(it.key) ? 'traced' : 'dim');
+    const label = (it.kind === 'sub' ? 'Subtask ' : 'Task ') + it.title + (due ? ', due ' + P.dueLong(due) : '')
+      + (waits.length ? ', waits for ' + waits.length : '') + (it.done ? ', done' : '');
+    return '<li class="' + cls.join(' ') + '" data-key="' + it.key + '" data-k="mxl:' + it.key + '" tabindex="0" role="button"'
+      + ' aria-label="' + esc(label) + '" aria-describedby="mx-li-help">'
+      + '<input type="checkbox" class="note-check" data-act="note-check" data-k="mxl:' + it.key + ':check"' + (it.done ? ' checked' : '')
+      + ' aria-label="Done: ' + esc(it.title) + '" tabindex="-1">'
+      + '<span class="mx-li-body"><span class="mx-li-title">' + esc(it.title) + '</span>'
+      + (meta.length ? '<span class="note-meta">' + meta.join('') + '</span>' : '') + '</span></li>';
+  }
+
+  function listsHTML(placed, counts, now) {
+    return '<div class="mx-lists">' + ['do', 'schedule', 'delegate', 'eliminate'].map((q) => {
+      const items = placed.filter((it) => quadOf(it) === q).sort(byImportance);
+      return '<section class="mx-list q-' + q + '" aria-labelledby="mxl-' + q + '">'
+        + '<h2 id="mxl-' + q + '"><strong>' + QUADS[q].name + '</strong> <span class="mx-q-count" aria-label="' + counts[q] + ' open">'
+        + counts[q] + '</span><span class="mx-q-sub">' + QUADS[q].sub + '</span></h2>'
+        + (items.length ? '<ul>' + items.map((it) => listItemHTML(it, now)).join('') + '</ul>' : '<p class="view-sub">Nothing here.</p>')
+        + '</section>';
+    }).join('') + '<p id="mx-li-help" class="sr-only">Tap to select, then move it or open it. Enter opens it.</p></div>';
+  }
+
+  /** Touch screens: buttons for the selected note or tray item (phones
+   *  cannot drag a note to the tray when the tray is off screen). */
+  function actionsHTML() {
+    if (M.linking) {
+      const from = M.items.get(M.linking);
+      return '<div class="mx-actions linking" role="group" aria-label="Add a link">'
+        + '<div class="mx-actions-top"><span class="mx-actions-title">Tap the item that must wait for “' + esc(from ? from.title : '') + '”.</span>'
+        + '<button type="button" class="btn" data-act="cancel-link" data-k="mxa:cancel-link">Cancel</button></div></div>';
+    }
+    const it = M.trace ? M.items.get(M.trace) : null;
+    if (!it) return '';
+    const linkChip = (d, other) => '<span class="mx-link-chip">' + esc(other)
+      + '<button type="button" class="chip-x" data-act="unlink-id" data-dep="' + d.id + '" data-k="mxa:unlink:' + d.id + '"'
+      + ' aria-label="Remove the link with ' + esc(other) + '">✕</button></span>';
+    const waits = M.deps.filter((d) => d.after === it.key);
+    const before = M.deps.filter((d) => d.before === it.key);
+    const links = (waits.length ? '<div class="mx-actions-links"><span class="mx-actions-label">Waits for</span>'
+        + waits.map((d) => linkChip(d, d.before_title)).join('') + '</div>' : '')
+      + (before.length ? '<div class="mx-actions-links"><span class="mx-actions-label">Before</span>'
+        + before.map((d) => linkChip(d, d.after_title)).join('') + '</div>' : '');
+    const current = it.pos ? quadOf(it) : null;
+    const moves = ['do', 'schedule', 'delegate', 'eliminate'].map((q) => '<button type="button" class="btn q-' + q + '" data-act="move-to"'
+      + ' data-quad="' + q + '" data-k="mxa:' + q + '" aria-pressed="' + (current === q) + '">' + QUADS[q].name + '</button>').join('');
+    return '<div class="mx-actions" role="group" aria-label="Selected ' + (it.kind === 'sub' ? 'subtask' : 'task') + '">'
+      + '<div class="mx-actions-top"><span class="mx-actions-title">' + esc(it.title) + '</span>'
+      + '<button type="button" class="btn" data-act="open-selected" data-k="mxa:open">Open</button>'
+      + '<button type="button" class="icon-btn" data-act="deselect" data-k="mxa:close" aria-label="Clear the selection">✕</button></div>'
+      + '<div class="mx-actions-move" role="group" aria-label="Move to">' + moves + '</div>'
+      + (it.pos ? '<div class="mx-actions-links">'
+        + '<button type="button" class="btn" data-act="move-to" data-quad="" data-k="mxa:tray">Back to unsorted</button>'
+        + '<button type="button" class="btn" data-act="start-link" data-k="mxa:link">⇢ Must happen before…</button></div>' : '')
+      + links
+      + '</div>';
+  }
+
+  function moveTo(key, quad) {
+    const it = M.items.get(key);
+    if (!it) return;
+    if (!quad) { if (it.pos) moveItems([{ key, pos: null }], { manual: true }); return; }
+    if (it.pos && quadOf(it) === quad) return;
+    moveItems([{ key, pos: P.positionIn(quad, key) }], { manual: true });
+  }
+
   function trayItemHTML(it, header) {
     if (header) {
       return '<div class="tray-head" data-key="' + it.key + '">' + esc(it.title)
@@ -247,11 +338,15 @@
     const filter = (key, label) => '<button type="button" class="seg-btn" data-act="filter" data-filter="' + key + '" data-k="mxf:' + key + '"'
       + ' aria-pressed="' + M.filters[key] + '">' + label + '</button>';
     const dep = M.selectedDep != null ? M.deps.find((d) => d.id === M.selectedDep) : null;
+    const actions = actionsHTML();
 
-    return '<div class="mx">'
+    return '<div class="mx' + (actions ? ' has-actions' : '') + '">'
       + '<div class="mx-main">'
       + '<div class="mx-head"><h1 class="view-title" id="mx-title">Eisenhower matrix</h1>'
       + '<div class="mx-filters seg" role="group" aria-label="Show">' + filter('tasks', 'Tasks') + filter('subs', 'Subtasks') + filter('done', 'Show done') + '</div>'
+      + (TT.NARROW.matches ? '<div class="mx-views seg" role="group" aria-label="Layout">'
+        + '<button type="button" data-act="mx-view" data-view="lists" data-k="mxv:lists" aria-pressed="' + (M.view === 'lists') + '">Lists</button>'
+        + '<button type="button" data-act="mx-view" data-view="board" data-k="mxv:board" aria-pressed="' + (M.view === 'board') + '">Board</button></div>' : '')
       + (S.q.trim() || S.labelIds.length ? '<span class="view-sub">Filtered by the sidebar and search</span>' : '')
       + '</div>'
       + '<div class="mx-today" role="group" aria-label="Today: open items in Do"><span class="mx-today-label">Today</span>'
@@ -260,7 +355,7 @@
       + (dep ? '<div class="mx-linkbar" role="group" aria-label="Selected link"><span>Link: <strong>' + esc(dep.before_title) + '</strong> before <strong>'
         + esc(dep.after_title) + '</strong></span><button type="button" class="btn danger" data-act="unlink" data-k="mx:unlink">Remove link</button>'
         + '<span class="view-sub">(or press Delete)</span></div>' : '')
-      + '<div class="mx-board-wrap">'
+      + (listsMode() ? listsHTML(placed, counts, now) : '<div class="mx-board-wrap">'
       + '<div class="mx-axis-y" aria-hidden="true">Low → Importance → High</div>'
       + '<div class="mx-board" id="mx-board" role="application" aria-labelledby="mx-title">'
       + quads
@@ -268,7 +363,7 @@
       + '<div class="mx-notes">' + placed.map((it) => noteHTML(it, now)).join('') + '</div>'
       + '</div>'
       + '<div class="mx-axis-x" aria-hidden="true">Low → Urgency → High</div>'
-      + '</div>'
+      + '</div>')
       + '<p id="mx-note-help" class="sr-only">Arrow keys move the note, Shift moves further, Enter opens it, Space shows its chain, Delete puts it back in the tray.</p>'
       + '</div>'
       + '<aside class="mx-tray" aria-label="Unsorted">'
@@ -277,6 +372,7 @@
       + '</div>'
       + '<div class="mx-tray-list">' + (groups.join('') || '<p class="view-sub">Everything is on the board.</p>') + '</div>'
       + '</aside>'
+      + actions
       + '</div>';
   }
 
@@ -501,6 +597,38 @@
     return r && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
   }
 
+  // A finger swipe over notes must scroll the page, so on touch screens a
+  // drag starts only after a short hold. Once it has started, touchmove is
+  // cancelled (that listener is registered up front in bind(): Chrome only
+  // lets a touch sequence be cancelled if a blocking listener was there
+  // when it began).
+  let touchDragging = false;
+
+  function afterHold(e, start) {
+    if (e.pointerType !== 'touch') { start(e); return; }
+    const id = e.pointerId;
+    const x0 = e.clientX;
+    const y0 = e.clientY;
+    const stop = () => {
+      clearTimeout(timer);
+      window.removeEventListener('pointermove', onMove, true);
+      window.removeEventListener('pointerup', stop, true);
+      window.removeEventListener('pointercancel', stop, true);
+    };
+    const onMove = (ev) => {
+      if (ev.pointerId === id && Math.abs(ev.clientX - x0) + Math.abs(ev.clientY - y0) > HOLD_SLOP) stop();
+    };
+    const timer = setTimeout(() => {
+      stop();
+      touchDragging = true;
+      try { if (navigator.vibrate) navigator.vibrate(12); } catch (err) { /* not allowed */ }
+      start(e);
+    }, HOLD_MS);
+    window.addEventListener('pointermove', onMove, true);
+    window.addEventListener('pointerup', stop, true);
+    window.addEventListener('pointercancel', stop, true);
+  }
+
   /** Drag a note around the board (or onto the tray to unplace it). */
   function startNoteDrag(e, note) {
     const box = boardBox();
@@ -530,6 +658,7 @@
     const finish = (ev, cancel) => {
       if (finished) return;
       finished = true;
+      touchDragging = false;
       window.removeEventListener('pointermove', onMove, true);
       window.removeEventListener('pointerup', onUp, true);
       window.removeEventListener('pointercancel', onCancel, true);
@@ -586,6 +715,7 @@
     const finish = (ev, cancel) => {
       if (finished) return;
       finished = true;
+      touchDragging = false;
       window.removeEventListener('pointermove', onMove, true);
       window.removeEventListener('pointerup', onUp, true);
       window.removeEventListener('pointercancel', onCancel, true);
@@ -681,9 +811,13 @@
       const link = e.target.closest('.note-link');
       const note = e.target.closest('#mx-board .note');
       if (link && note) { e.preventDefault(); startLinkDrag(e, note); return; }
-      if (note && !e.target.closest('.note-check')) { startNoteDrag(e, note); return; }
+      if (note && !e.target.closest('.note-check')) { afterHold(e, (ev) => startNoteDrag(ev, note)); return; }
       const trayItem = e.target.closest('.tray-item');
-      if (trayItem && !e.target.closest('.suggest-chip')) startTrayDrag(e, trayItem);
+      if (trayItem && !e.target.closest('.suggest-chip')) afterHold(e, (ev) => startTrayDrag(ev, trayItem));
+    });
+    page.addEventListener('touchmove', (e) => { if (touchDragging && e.cancelable) e.preventDefault(); }, { passive: false });
+    page.addEventListener('contextmenu', (e) => {
+      if (e.target.closest('#mx-board .note, .tray-item')) e.preventDefault();   // long press: no menu
     });
     page.addEventListener('click', (e) => {
       const el = e.target.closest('[data-act]');
@@ -726,7 +860,32 @@
           return;
         }
         if (act === 'unlink' && M.selectedDep != null) { removeLink(M.selectedDep); return; }
+        if (act === 'open-selected') { const it = M.items.get(M.trace); if (it) openItem(it); return; }
+        if (act === 'deselect') { setTrace(null); return; }
+        if (act === 'move-to') { moveTo(M.trace, el.dataset.quad || null); return; }
+        if (act === 'unlink-id') { removeLink(Number(el.dataset.dep)); return; }
+        if (act === 'start-link') { M.linking = M.trace; render(); return; }
+        if (act === 'cancel-link') { M.linking = null; render(); return; }
+        if (act === 'mx-view') {
+          M.view = el.dataset.view === 'board' ? 'board' : 'lists';
+          TT.save('tt-mx-view', M.view);
+          render();
+          return;
+        }
       }
+      const picked = e.target.closest('.mx-li, #mx-board .note, .tray-item');
+      if (picked && M.linking) {
+        const from = M.linking;
+        M.linking = null;
+        if (picked.dataset.key === from) { toast('An item cannot wait for itself.', { kind: 'error' }); render(); return; }
+        M.trace = from;
+        addLink(from, picked.dataset.key);
+        return;
+      }
+      const li = e.target.closest('.mx-li');
+      if (li) { setTrace(li.dataset.key); return; }
+      const trayItem = e.target.closest('.tray-item');
+      if (trayItem && (TT.TOUCH.matches || TT.NARROW.matches)) { setTrace(trayItem.dataset.key); return; }
       if (note && !e.target.closest('.note-link')) {
         // A double click opens the note. The board may have been rebuilt
         // between the two clicks (the first one traces), and then the
@@ -749,13 +908,18 @@
     });
     page.addEventListener('change', (e) => {
       if (e.target.dataset.act !== 'note-check') return;
-      const it = M.items.get(e.target.closest('.note').dataset.key);
+      const it = M.items.get(e.target.closest('.note, .mx-li').dataset.key);
       if (it) completeItem(it, e.target.checked);
     });
     page.addEventListener('keydown', (e) => {
       const el = e.target;
       const note = el.classList && el.classList.contains('note') ? el : null;
       if (note) { noteKeydown(e, note); return; }
+      if (el.classList && el.classList.contains('mx-li')) {
+        if (e.key === 'Enter') { e.preventDefault(); const it = M.items.get(el.dataset.key); if (it) openItem(it); }
+        else if (e.key === ' ') { e.preventDefault(); setTrace(el.dataset.key); }
+        return;
+      }
       if (el.classList && el.classList.contains('tray-item') && e.key === 'Enter') {
         e.preventDefault();
         const items = $$('.mx-tray .tray-item');
@@ -786,6 +950,7 @@
     if (window.ResizeObserver) {
       new ResizeObserver(() => { if (M.shown && !TT.held()) layout(); }).observe(page);
     }
+    TT.NARROW.addEventListener('change', () => { M.linking = null; render(); });
   }
 
   function isTyping(el) {
@@ -839,6 +1004,7 @@
 
   function escape(e) {
     if (S.page !== 'matrix') return false;
+    if (M.linking) { e.preventDefault(); M.linking = null; render(); return true; }
     if (M.trace || M.highlight || M.selectedDep != null) {
       e.preventDefault();
       M.trace = null;
