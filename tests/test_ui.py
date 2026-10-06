@@ -1672,8 +1672,8 @@ class LocalModeTests(UICase):
 
     BRIDGE = ('window.__bridge = {notify: [], schedule: [], saveFile: []};'
               'window.TodoTrackerAndroid = {'
-              ' notify(j) { __bridge.notify.push(JSON.parse(j)); },'
-              ' schedule(j) { __bridge.schedule.push(JSON.parse(j)); },'
+              ' showReminders(j) { __bridge.notify.push(JSON.parse(j)); },'
+              ' scheduleReminders(j) { __bridge.schedule.push(JSON.parse(j)); },'
               ' saveFile(name, type, text) { __bridge.saveFile.push({name, type, text}); } };')
 
     def setUp(self):
@@ -1800,9 +1800,10 @@ class LocalModeTests(UICase):
         p.wait_for('__bridge.schedule.length > 0 && __bridge.notify.length > 0', timeout=5)
         shown = p.eval('__bridge.notify.flat()')
         self.assertEqual([n['title'] for n in shown], ['Imported overdue'])
-        self.assertTrue(shown[0]['key'].startswith('t'))
+        self.assertEqual(shown[0]['keys'], ['t4@2021-03-04T05:06'])
         upcoming = p.eval('__bridge.schedule[__bridge.schedule.length - 1]')
-        self.assertEqual([(u['title'], u['body']) for u in upcoming], [('Later', 'Due today 08:30')])
+        self.assertEqual([(u['key'], u['local'], u['title'], u['body']) for u in upcoming],
+                         [('t3@2031-05-05T08:30', '2031-05-05T08:30', 'Later', 'Due today 08:30')])
         import datetime as _dt
         self.assertEqual(upcoming[0]['at'], int(_dt.datetime(2031, 5, 5, 8, 30).timestamp() * 1000))
         p.eval('TT.checkLocalReminders()')

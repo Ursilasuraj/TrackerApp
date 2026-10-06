@@ -1,0 +1,52 @@
+# Every push: the backend, installers, on-device data (localdb.js) and the
+# Android logic on Windows, macOS and Linux; the UI suite in Chromium.
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.12']
+        include:
+          - os: ubuntu-latest
+            python: '3.9'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Android's org.json (for the Java logic tests)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y -q libandroid-json-java
+      - name: Backend, installers, local data, Android logic
+        run: python -m unittest -v tests.test_backend tests.test_install tests.test_localdb tests.test_android
+      - name: Parsers
+        run: node --test tests/parsers.test.js
+
+  ui:
+    name: UI (Chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Let Chromium use its sandbox (Ubuntu 24.04 restricts user namespaces)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: UI tests, server mode and the Android app's local mode
+        run: python -m unittest -v tests.test_ui

@@ -1,0 +1,52 @@
+# Builds the Android app. Signed with your key when the repository has the
+# secrets TODOTRACKER_KEYSTORE_B64 (base64 of your .p12 key) and
+# TODOTRACKER_KEYSTORE_PASSWORD; otherwise with a throwaway key, good for a
+# first install only (an app signed with another key cannot update it).
+name: Android APK
+
+on:
+  push:
+    paths: ['web/**', 'android/**', 'tools/build_apk.py', 'tools/icons.py', 'server.py', '.github/workflows/android.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # the version code counts the commits
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Signing key
+        id: key
+        env:
+          KEY_B64: ${{ secrets.TODOTRACKER_KEYSTORE_B64 }}
+          KEY_PASSWORD: ${{ secrets.TODOTRACKER_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -n "$KEY_B64" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "$KEY_B64" | base64 -d > "$RUNNER_TEMP/release.p12"
+            echo "keystore=$RUNNER_TEMP/release.p12" >> "$GITHUB_OUTPUT"
+            echo "name=TodoTracker" >> "$GITHUB_OUTPUT"
+            echo "new=" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No signing key in the repository secrets: this APK uses a throwaway key and cannot update an app installed from your own build."
+            echo "TODOTRACKER_KEYSTORE_PASSWORD=throwaway-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+            echo "keystore=$RUNNER_TEMP/throwaway.p12" >> "$GITHUB_OUTPUT"
+            echo "name=TodoTracker-throwaway-key" >> "$GITHUB_OUTPUT"
+            echo "new=--new-keystore" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build
+        env:
+          TODOTRACKER_KEYSTORE_PASSWORD: ${{ secrets.TODOTRACKER_KEYSTORE_PASSWORD || env.TODOTRACKER_KEYSTORE_PASSWORD }}
+        run: python3 tools/build_apk.py --sdk "$ANDROID_HOME" --keystore "${{ steps.key.outputs.keystore }}" ${{ steps.key.outputs.new }} --out "dist/${{ steps.key.outputs.name }}.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.key.outputs.name }}-apk
+          path: dist/*.apk
+          if-no-files-found: error

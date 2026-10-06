@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The page background (bg in web/app.css), shown before the page has loaded -->
+    <color name="window_bg">#f5f6f8</color>
+    <color name="ic_launcher_background">#2563eb</color>
+</resources>

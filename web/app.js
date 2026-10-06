@@ -233,23 +233,26 @@
     const due = local.store.dueReminders(now);
     if (due.length) {
       const shown = window.TTLocal.compose(due, now);
-      if (ANDROID && ANDROID.notify) {
-        ANDROID.notify(JSON.stringify(shown.map(([title, body], i) => ({
-          key: due.length > 3 ? 'summary@' + local.store.data.changes : due[i].kind[0] + due[i].id + '@' + due[i].due_at, title, body }))));
+      const keys = due.map((it) => it.kind[0] + it.id + '@' + it.due_at);     // as in scheduleReminders
+      if (ANDROID && ANDROID.showReminders) {
+        // Each notification lists the items it covers, so the app shows every
+        // item once, whether its alarm or this page gets there first.
+        ANDROID.showReminders(JSON.stringify(shown.map(([title, body], i) => ({
+          keys: shown.length === 1 && due.length > 1 ? keys : [keys[i]], title, body }))));
       } else if (window.Notification && Notification.permission === 'granted') {
         for (const [title, body] of shown) { try { new Notification(title, { body }); } catch (e) { /* not allowed here */ } }
       }
     }
-    if (ANDROID && ANDROID.schedule) {
+    if (ANDROID && ANDROID.scheduleReminders) {
       const upcoming = local.store.upcomingReminders(64).map((r) => {
         const at = new Date(Number(r.at.slice(0, 4)), Number(r.at.slice(5, 7)) - 1, Number(r.at.slice(8, 10)),
           Number(r.at.slice(11, 13)), Number(r.at.slice(14, 16)));
         const item = r.key[0] === 't' ? { kind: 'task', title: r.title, due_at: r.due_at }
           : { kind: 'subtask', title: r.title, due_at: r.due_at, task_title: r.task_title };
         const [title, body] = window.TTLocal.compose([item], at)[0];
-        return { key: r.key + '@' + r.due_at, at: at.getTime(), title, body };
+        return { key: r.key + '@' + r.due_at, at: at.getTime(), local: r.at, title, body };
       });
-      ANDROID.schedule(JSON.stringify(upcoming));
+      ANDROID.scheduleReminders(JSON.stringify(upcoming));
     }
   }
 

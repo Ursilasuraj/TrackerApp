@@ -59,6 +59,8 @@ VARIANTS = {
     'maskable': {'box': (0.0, 1.0), 'background': 'full'},
     # Android adaptive icon foreground (108dp canvas, 72dp visible): tick only.
     'foreground': {'box': ((1 - 72 / 108) / 2, 72 / 108), 'background': None},
+    # Android status bar: a white tick filling the icon (only its shape counts).
+    'mono': {'box': (-0.25, 1.5), 'background': None},
 }
 
 
@@ -135,11 +137,13 @@ ANDROID_DENSITIES = {'mdpi': 1.0, 'hdpi': 1.5, 'xhdpi': 2.0, 'xxhdpi': 3.0, 'xxx
 
 
 def make_android(res_dir):
-    """Legacy launcher icons (48dp) plus adaptive-icon foregrounds (108dp)."""
+    """Launcher icons (48dp; Android 8+ uses the 108dp foreground on its own
+    shape) and the 24dp status bar icon for reminders."""
     for name, factor in ANDROID_DENSITIES.items():
         folder = os.path.join(res_dir, 'mipmap-' + name)
         write(os.path.join(folder, 'ic_launcher.png'), png(render(round(48 * factor))))
         write(os.path.join(folder, 'ic_launcher_foreground.png'), png(render(round(108 * factor), 'foreground')))
+        write(os.path.join(res_dir, 'drawable-' + name, 'ic_notification.png'), png(render(round(24 * factor), 'mono')))
 
 
 def make_iconset(folder):

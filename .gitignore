@@ -3,3 +3,11 @@ data/
 __pycache__/
 *.pyc
 *.log
+
+# Android: built APKs, and signing keys (keep yours private and backed up).
+dist/
+*.apk
+*.jks
+*.p12
+*.keystore
+keystore-password*.txt
